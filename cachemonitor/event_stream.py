@@ -147,14 +147,27 @@ class EventLines:
                 self.prefix.clear()
         if self.projection is not None:self.projection.feed(part)
 
-    def read(self,source,limit):
+    def read(self,source,limit,*,first_record=False):
         source.seek(self.read_offset)
         left=limit
-        native=get_native()
+        native=None if first_record else get_native()
         try:
             while left:
-                block=source.read(min(self.CHUNK,left))
-                if not block:break
+                block=(source.readline(min(self.CHUNK,left,2*1024*1024)) if first_record
+                       else source.read(min(self.CHUNK,left)))
+                if not block:
+                    if first_record and self.read_offset>self.committed:
+                        try:
+                            if self.error:raise self.error
+                            self.feed(b'',True)
+                        except (ValueError,TypeError,UnicodeError):event=b'{'
+                        else:
+                            try:event=json.dumps(self.projection.finish(),ensure_ascii=False).encode('utf-8')
+                            except (ValueError,TypeError,UnicodeError):break
+                        self.event_end=self.committed=self.read_offset
+                        self.committed_digest=self.digest.copy()
+                        yield self.line_start,event
+                    break
                 self.bytes_read+=len(block);left-=len(block)
                 while block:
                     if native is not None and self.selected is None and not self.prefix:
@@ -178,7 +191,7 @@ class EventLines:
                     part,block=block[:end],block[end:]
                     # JSONL separators are LF; CR alone is ordinary whitespace.
                     complete=part.endswith(b'\n')
-                    direct=complete and self.selected is None and not self.prefix
+                    direct=complete and self.selected is None and not self.prefix and not first_record
                     self.digest.update(part);self.read_offset+=len(part)
                     try:
                         if not direct:self.feed(part[:-1] if complete else part,complete)
@@ -193,7 +206,7 @@ class EventLines:
                             if self.error:raise self.error
                             if self.projection is not None:event=self.projection.finish()
                         except (ValueError,TypeError,UnicodeError) as error:event=error
-                        if self.header_only and (not isinstance(event,dict) or event.get('type')!='session_meta'):event=None
+                        if self.header_only and not (first_record and isinstance(event,Exception)) and (not isinstance(event,dict) or event.get('type')!='session_meta'):event=None
                         position=self.line_start
                         self.committed=self.read_offset;self.committed_digest=self.digest.copy()
                         self.line_start=self.read_offset;self.prefix.clear();self.selected=None;self.projection=None;self.error=None;self.header_only=False
@@ -202,4 +215,5 @@ class EventLines:
                             elif not isinstance(event,bytes):event=json.dumps(event,ensure_ascii=False).encode('utf-8')
                             self.event_end=self.committed
                             yield position,event
+                        if first_record:return
         finally:source.seek(self.committed)

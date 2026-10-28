@@ -1186,7 +1186,8 @@ def test_selected_parent_discovers_child_after_large_ignored_session_metadata(tm
     assert path.read_bytes()==original
 
 
-def test_pending_discovery_header_resumes_before_membership_is_complete(tmp_path,monkeypatch):
+@pytest.fixture
+def pending_discovery(tmp_path,monkeypatch):
     import cachemonitor.index as implementation
     monkeypatch.setattr(implementation,'FILE_READ_BUDGET',1024)
     home,_=fixture_home(tmp_path)
@@ -1200,13 +1201,107 @@ def test_pending_discovery_header_resumes_before_membership_is_complete(tmp_path
         if args[0]==str(path.resolve()):clock[0]+=.41
         return result
     monkeypatch.setattr(index,'scan_file',one_slice)
+    try:yield index,home,path,sid
+    finally:index.close()
+
+
+def test_pending_discovery_header_resumes_before_membership_is_complete(pending_discovery):
+    index,home,path,sid=pending_discovery
+    partial=index.poll(10010)
+    assert partial['index']['loading'] and not partial['catalog_complete']
+    assert not partial['usage_collection_complete']
+    complete=finish(index)
+    assert complete['catalog_complete'] and complete['usage_collection_complete'] and not complete['usage_errors']
+    assert [str(home.resolve()),sid,TID] in complete['session_catalog']
+    assert [str(home.resolve()),sid] in complete['demand_members']
+    assert {row['key'] for row in analyze(complete['sessions'])['responses']}=={'r1','child-response'}
+
+
+def test_replaced_pending_discovery_header_uses_the_new_source_identity(pending_discovery):
+    index,home,path,old_sid=pending_discovery
+    assert not index.poll(10010)['catalog_complete']
+    sid='12345678-abcd-abcd-abcd-444444444444'
+    path.write_text(json.dumps(event('session_meta',id=sid,parent_thread_id=TID))+'\n'+
+                    json.dumps(usage('replacement',tid=sid))+'\n',encoding='utf8')
+    complete=finish(index)
+    assert complete['catalog_complete'] and complete['usage_collection_complete'] and not complete['usage_errors']
+    assert [str(home.resolve()),sid,TID] in complete['session_catalog']
+    assert not any(row[1]==old_sid for row in complete['session_catalog'])
+    assert {row['key'] for row in analyze(complete['sessions'])['responses']}=={'r1','replacement'}
+
+
+def test_truncated_discovery_header_waits_without_idle_rereads_and_recovers(pending_discovery):
+    index,home,path,sid=pending_discovery
+    original=path.read_bytes()
+    path.write_bytes(b'{"ignored":"'+b'x'*8192)
+    for _ in range(20):
+        waiting=index.poll(10010)
+        assert not waiting['catalog_complete'] and not waiting['usage_collection_complete']
+        assert waiting['index']['loading']
+    before=index.bytes_read
+    for _ in range(3):index.poll(10010)
+    assert index.bytes_read==before
+    path.write_bytes(original)
+    complete=finish(index)
+    assert complete['catalog_complete'] and complete['usage_collection_complete'] and not complete['usage_errors']
+    assert [str(home.resolve()),sid,TID] in complete['session_catalog']
+    assert {row['key'] for row in analyze(complete['sessions'])['responses']}=={'r1','child-response'}
+
+
+def test_malformed_discovery_header_reports_failure_until_replaced(pending_discovery):
+    index,home,path,sid=pending_discovery
+    original=path.read_bytes()
+    path.write_bytes(b'{"type":"session_meta",broken}\n')
+    for _ in range(2):
+        failed=index.poll(10010)
+        assert not failed['catalog_complete'] and not failed['usage_collection_complete']
+        assert failed['usage_errors'] and failed['collection_fault']['read_failed']
+    path.write_bytes(original)
+    complete=finish(index,10021)
+    assert complete['catalog_complete'] and complete['usage_collection_complete'] and not complete['usage_errors']
+    assert [str(home.resolve()),sid,TID] in complete['session_catalog']
+
+
+def test_cancelling_selection_keeps_header_discovery_without_loading_child_history(pending_discovery):
+    index,home,path,sid=pending_discovery
+    assert not index.poll(10010)['catalog_complete']
+    index.demand=dict(selected=[],aggregate=False,evidence=[])
+    idle=finish(index)
+    assert idle['catalog_complete'] and idle['usage_collection_complete'] and not idle['sessions']
+    assert [str(home.resolve()),sid,TID] in idle['session_catalog']
+    assert idle['demand_members']==[]
+    assert index.db.execute('SELECT count(*) FROM events WHERE tid=?',(sid,)).fetchone()[0]==0
+    index.demand=dict(selected=[(None,TID)],aggregate=False,evidence=[])
+    complete=finish(index)
+    assert {row['key'] for row in analyze(complete['sessions'])['responses']}=={'r1','child-response'}
+
+
+def test_discovery_accepts_complete_first_record_without_line_feed(tmp_path):
+    home,_=fixture_home(tmp_path)
+    path,sid=discovery_child(home,1024)
+    path.write_bytes(json.dumps(event('session_meta',id=sid,parent_thread_id=TID)).encode())
+    index=UsageIndex([home],tmp_path/'index.sqlite')
+    index.demand=dict(selected=[(None,TID)],aggregate=False,evidence=[])
     try:
-        partial=index.poll(10010)
-        assert partial['index']['loading'] and not partial['catalog_complete']
-        assert not partial['usage_collection_complete']
         complete=finish(index)
         assert complete['catalog_complete'] and complete['usage_collection_complete'] and not complete['usage_errors']
         assert [str(home.resolve()),sid,TID] in complete['session_catalog']
         assert [str(home.resolve()),sid] in complete['demand_members']
-        assert {row['key'] for row in analyze(complete['sessions'])['responses']}=={'r1','child-response'}
+    finally:index.close()
+
+
+def test_discovery_preserves_selected_metadata_projection_admission(tmp_path,monkeypatch):
+    from cachemonitor.event_stream import EventProjection
+    monkeypatch.setattr(EventProjection,'MAX_SELECTED',256)
+    home,_=fixture_home(tmp_path)
+    path,sid=discovery_child(home,0)
+    header=event('session_meta',id=sid,parent_thread_id=TID,agent_nickname='x'*512)
+    path.write_text(json.dumps(header)+'\n',encoding='utf8')
+    index=UsageIndex([home],tmp_path/'index.sqlite')
+    index.demand=dict(selected=[(None,TID)],aggregate=False,evidence=[])
+    try:
+        failed=index.poll(10010)
+        assert not failed['catalog_complete'] and not failed['usage_collection_complete']
+        assert failed['usage_errors'] and failed['collection_fault']['read_failed']
+        assert not any(row[1]==sid for row in failed['session_catalog'])
     finally:index.close()

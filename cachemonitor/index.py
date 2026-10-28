@@ -214,7 +214,8 @@ class UsageIndex:
         self.active_members=set()
         self.active_sources=set()
         self.selected_members=set()
-        self.catalog_complete=False
+        self.discovery_complete=False
+        self.header_pending=set()
         self.replay = None
         selected_homes={str(h) for h in self.homes}
         self.metadata = {(r[0],r[1]):json.loads(r[2]) for r in self.db.execute('select home,tid,data from metadata') if all_metadata or r[0] in selected_homes}
@@ -308,8 +309,72 @@ class UsageIndex:
                         except (ValueError,TypeError,AttributeError): continue
                 except (OSError,ValueError,TypeError,AttributeError): continue
 
+    @property
+    def catalog_complete(self):
+        return self.discovery_complete and not self.header_pending
+
+    def discover_header(self,path,home,tid):
+        from .event_stream import EventLines
+        self.header_pending.add(path);signature=None;state=None
+        try:
+            st=Path(path).stat();signature=(st.st_size,st.st_mtime_ns,str(st.st_ino))
+            partial=self.partial_work.get(path)
+            if partial is not None and partial.get('header_pending'):
+                if partial['signature']==signature:
+                    if partial.get('error'):raise ValueError('Invalid source header')
+                    return tid
+                self.partial_work.pop(path)
+            state=self.source_work.get(path)
+            if state is None:
+                if len(self.source_work)>=MAX_SOURCE_WORK:return tid
+                state={};self.source_work[path]=state
+            if state.get('header_signature')!=signature:
+                state.update(header_signature=signature,header_reader=EventLines(0,hashlib.sha256()))
+            reader=state['header_reader'];before=reader.bytes_read
+            with Path(path).open('rb') as source:
+                try:record=next(reader.read(source,FILE_READ_BUDGET,first_record=True),None)
+                finally:self.bytes_read+=reader.bytes_read-before
+            if not reader.committed:
+                if reader.read_offset>=st.st_size:
+                    self.partial_work[path]=dict(signature=signature,header_pending=True)
+                return tid
+            header=json.loads(record[1]) if record is not None else None
+            if isinstance(header,dict) and header.get('type')=='session_meta':
+                payload=header.get('payload')
+                if tid is None:
+                    candidate=payload.get('id') if isinstance(payload,dict) else None
+                    tid=candidate if isinstance(candidate,str) else None
+                if tid:
+                    key=(str(home),tid);lineage=session_lineage(payload,tid)
+                    self.lineage[key]=lineage
+                    prior=self.metadata.get(key);meta=dict(prior or {},id=tid)
+                    meta.update({field:value for field,value in lineage.items() if not meta.get(field)})
+                    if meta.get('parent_thread_id'):meta['thread_source']='subagent'
+                    names=self.names.get(str(home))
+                    if names:meta.update(names.resolve(meta))
+                    if meta!=prior:
+                        self.metadata[key]=meta
+                        self.db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?,?)',(*key,json.dumps(meta,ensure_ascii=False)))
+            self.header_pending.discard(path)
+            return tid
+        except FileNotFoundError:
+            self.header_pending.discard(path)
+            return tid
+        except (OSError,ValueError,TypeError):
+            if signature is not None:self.partial_work[path]=dict(signature=signature,header_pending=True,error=True)
+            self.failed_sources.add((str(home),tid))
+            self.errors.append(f'기록 머리말 확인 필요: {Path(path).name}')
+            self.collection_fault['read_failed']=True
+            return tid
+        finally:
+            partial=self.partial_work.get(path)
+            if state is not None and (path not in self.header_pending or partial is not None and partial.get('header_pending')):
+                state.pop('header_reader',None);state.pop('header_signature',None)
+                if not state:self.source_work.pop(path,None)
+            while len(self.partial_work)>MAX_SOURCE_WORK:self.partial_work.popitem(last=False)
+
     def discover(self, now):
-        paths = {}
+        paths = {};self.discovery_complete=True
         for home in self.homes:
             try:
                 with readonly(home / 'state_5.sqlite') as db:
@@ -322,16 +387,8 @@ class UsageIndex:
                     for row in db.execute('select ' + task_select(cols) + ' from threads'):
                         meta = dict(row)
                         key = (str(home), row['id'])
-                        # Read only the immutable header for lineage. Existing
-                        # event offsets and historical mode values are untouched.
                         if key not in self.lineage and row['rollout_path']:
-                            try:
-                                with Path(row['rollout_path']).open('rb') as source:
-                                    header=json.loads(source.readline(2*1024*1024))
-                                if isinstance(header,dict) and header.get('type')=='session_meta':
-                                    self.lineage[key]=session_lineage(header.get('payload'),row['id'])
-                            except (OSError,ValueError,TypeError):
-                                pass
+                            self.discover_header(str(Path(row['rollout_path']).resolve()).removeprefix('\\\\?\\'),home,row['id'])
                         meta.update({field:value for field,value in self.lineage.get(key,{}).items() if not meta.get(field)})
                         if meta.get('parent_thread_id'):meta['thread_source']='subagent'
                         meta.update(names.resolve(meta))
@@ -343,6 +400,7 @@ class UsageIndex:
                             if source is None:source=str(Path(row['rollout_path']).resolve()).removeprefix('\\\\?\\')
                             paths[source] = (home, row['id'])
             except (OSError, sqlite3.Error) as exc:
+                self.discovery_complete=False
                 self.errors.append(f'{home.name} / 세션 목록: {exc}')
                 self.collection_fault['read_failed']=True
             for folder in ('sessions', 'archived_sessions'):
@@ -353,18 +411,10 @@ class UsageIndex:
                     resolved = str(path.resolve()).removeprefix('\\\\?\\')
                     if resolved not in paths:
                         # A filename is not proof of ownership; session_meta supplies the ID.
-                        try:
-                            with path.open('rb') as source:header=json.loads(source.readline(2*1024*1024))
-                            payload=header.get('payload') if isinstance(header,dict) else None
-                            tid=payload.get('id') if isinstance(payload,dict) and header.get('type')=='session_meta' else None
-                            if not isinstance(tid,str):tid=None
-                        except (OSError,ValueError,TypeError):tid=None
-                        if tid:
-                            key=(str(home),tid)
-                            self.lineage[key]=session_lineage(payload,tid)
-                            self.metadata.setdefault(key,dict(id=tid,**self.lineage[key]))
+                        tid=self.discover_header(resolved,home,None)
                         paths[resolved] = (home, tid)
         # Replacing the discovery queue also releases owners that can no longer run.
+        self.header_pending.intersection_update(paths)
         self.source_work={path:state for path,state in self.source_work.items() if path in paths}
         self.source_hashes={path:value for path,value in self.source_hashes.items() if path in paths}
         self.verified_sources={path:value for path,value in self.verified_sources.items() if path in paths}
@@ -380,7 +430,6 @@ class UsageIndex:
             self.tier_backfill=False
         self.done_files = 0
         self.last_discovery = now
-        self.catalog_complete=not self.errors
 
     def admit_demand(self):
         known=set(self.metadata)|set(self.event_store.owners(tuple(str(home) for home in self.homes)))
@@ -417,15 +466,16 @@ class UsageIndex:
                 self.replay.restore_job.close();self.replay.restore_job=None
             self.replay.pending.clear()
         if self.demand is not None:
-            self.queue=deque(args for args in self.queue if self.demand['aggregate'] or (str(args[1]),args[2]) in sources)
+            self.queue=deque(args for args in self.queue if args[0] in self.header_pending or self.demand['aggregate'] or (str(args[1]),args[2]) in sources)
             self.pending_rebuilds=deque(key for key in self.pending_rebuilds if key in sources)
             self.cached_restore=deque(dict.fromkeys([key for key in self.cached_restore if key in sources]+
                 [key for key in sources if key not in self.loaded]))
             self.cached_restore=deque(sorted(self.cached_restore,key=lambda key:key not in selected))
             self.pending_rebuilds=deque(sorted(self.pending_rebuilds,key=lambda key:key not in selected))
             queued={args[0] for args in self.queue}
-            self.queue.extend(args for args in self.files if (self.demand['aggregate'] or (str(args[1]),args[2]) in sources)
-                              and (str(args[1]),args[2]) not in self.loaded and args[0] not in queued)
+            self.queue.extend(args for args in self.files if (args[0] in self.header_pending or
+                              (self.demand['aggregate'] or (str(args[1]),args[2]) in sources)
+                              and (str(args[1]),args[2]) not in self.loaded) and args[0] not in queued)
 
     def validate_cached_prefix(self, source, offset, path, home, tid, state, budget):
         """Check one prefix slice; None means more validation remains."""
@@ -467,6 +517,16 @@ class UsageIndex:
             rows.close()
 
     def scan_file(self, path, home, tid):
+        if path in self.header_pending:
+            tid=self.discover_header(path,home,tid)
+            if path in self.header_pending:
+                state=self.source_work.get(path)
+                if state is not None and 'header_reader' in state:self.queue.append((path,home,tid))
+                return None
+            for position,args in enumerate(self.files):
+                if args[0]==path:
+                    self.files[position]=(path,home,tid);break
+            if self.demand is not None and not self.demand['aggregate'] and (str(home),tid) not in self.active_sources:return None
         p = Path(path)
         try:
             st = p.stat()
@@ -873,6 +933,7 @@ class UsageIndex:
             # Periodic discovery still runs, but cannot consume every startup
             # recovery budget. Reserve half for retained owners, half for scans.
             self.restore_cached(now,min(deadline,time.monotonic()+.2))
+        pending_headers=bool(self.header_pending)
         while self.queue and time.monotonic() < deadline:
             args = self.queue.popleft()
             try:
@@ -887,6 +948,7 @@ class UsageIndex:
                 self.errors.append(f'기록 읽기: {Path(args[0]).name}: {exc}')
                 self.collection_fault['read_failed']=True
             self.done_files += 1
+        if pending_headers:self.admit_demand()
         try:self.db.commit()
         except sqlite3.Error:
             self.collection_fault['save_failed']=True
@@ -905,7 +967,7 @@ class UsageIndex:
         if not self.rebuild_jobs and time.monotonic()<deadline:
             self.event_store.migrate(deadline,owners=self.active_sources if self.demand is not None and not self.demand['aggregate'] else None)
         usage_errors=list(self.errors)
-        usage_complete=not self.queue and not self.cached_restore and not self.pending_rebuilds and not self.rebuild_jobs and not usage_errors
+        usage_complete=not self.header_pending and not self.queue and not self.cached_restore and not self.pending_rebuilds and not self.rebuild_jobs and not usage_errors
         if self.replay is not None and self.replay.restore_job is not None:usage_complete=False
         if self.demand is not None and self.demand['aggregate']:
             self.active_members.update(self.monitor.sessions)
@@ -1055,7 +1117,7 @@ class UsageIndex:
                 'unassigned_dropped': self.monitor.unassigned_dropped,
                 'excluded_title_sessions': sum(s.excluded_title for s in self.monitor.sessions.values() if not hasattr(s,'_replay_body')),
                 'quota_by_home':dict(self.quota_by_home),
-                'index': {'loading': bool(self.queue or self.cached_restore or self.pending_rebuilds or self.rebuild_jobs or evidence_pending
+                'index': {'loading': bool(self.header_pending or self.queue or self.cached_restore or self.pending_rebuilds or self.rebuild_jobs or evidence_pending
                                          or self.replay is not None and self.replay.restore_job is not None), 'done': min(self.done_files, sum(self.demand is None or self.demand['aggregate'] or (str(home),tid) in self.active_sources for _,home,tid in self.files)),
                           'usage_complete':usage_complete,'last_usage_success':self.last_usage_success,
                           'files': sum(self.demand is None or self.demand['aggregate'] or (str(home),tid) in self.active_sources for _,home,tid in self.files), 'bytes_read': self.bytes_read, 'version': self.version,
@@ -1119,6 +1181,7 @@ class UsageIndex:
         self.activity_rows = []
         self.activity_tokens = {}
         self.source_work.clear()
+        self.header_pending.clear()
         self.prioritized_roots.clear()
         self.verified_sources.clear()
         self.partial_work.clear()
