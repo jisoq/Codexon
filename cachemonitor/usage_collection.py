@@ -114,6 +114,11 @@ def publication_fingerprint(value):
         encoded=json.dumps(value,ensure_ascii=False,separators=(',',':')).encode('utf-8')
     return sha256(encoded).digest()
 
+def selection_request(homes, demand):
+    selected = tuple(dict.fromkeys(map(tuple, demand['selected'])))
+    evidence = tuple(dict.fromkeys(map(tuple, demand['evidence'])))
+    return publication_fingerprint((tuple(homes), selected, demand['aggregate'], evidence)).hex()
+
 
 def analysis_proof(session):
     """Certify every source fact except the top-level display title."""
@@ -177,7 +182,7 @@ class LiveCollection:
         self.recovery=recovery
         self.changed=threading.Condition(self.lock);self.closed=False;self.waiters=set()
 
-    def prepare(self,snapshot,epoch,sequence,*,changes=None):
+    def prepare(self,snapshot,epoch,sequence,*,changes=None,selections=None,selection_revision=None):
         previous=self.current
         same_epoch=previous is not None and previous['publication'][0]==epoch
         trusted=isinstance(changes,CollectionChanges) and changes.owner is not None
@@ -271,6 +276,8 @@ class LiveCollection:
                            state=json.loads(json.dumps(state,ensure_ascii=False)),owner_metadata=metadata,
                            owner_metadata_bytes=metadata_bytes,owner_lineage=lineage,owner_lineage_bytes=lineage_bytes,analysis_proof=proof)
                 state_revisions[key]=sequence
+            if entry.get('source_ordinal') != len(manifest):
+                entry = dict(entry, source_ordinal=len(manifest))
             entries[key]=entry;manifest.append(entry)
         activities_present='request_activity' in snapshot and not snapshot.get('activity_stream')
         activity_revision=changes.activity_revision if trusted else None
@@ -300,12 +307,30 @@ class LiveCollection:
         if same_epoch and (activity_manifest is old_manifest or activity_manifest==old_manifest):
             activity_digest=previous['activity_digest']
         else:activity_digest=publication_fingerprint(activity_manifest)
+        frozen_selections = {}
+        selection_content = {}
+        for request, selected in (selections or {}).items():
+            homes = selected['selected_homes']
+            allowed = set(homes)
+            membership = {name: selected[name] for name in ('matches', 'session_catalog', 'demand_members')}
+            membership = json.loads(json.dumps(membership, ensure_ascii=False))
+            keys = {(home, sid) for home, sid, _ in membership['session_catalog']}
+            refs = sorted((entries[key] for key in keys if key in entries and key[0] in allowed),
+                          key=lambda entry: entry['source_ordinal'])
+            inaccessible = any(found is not None and len(found) == 1 and found[0] not in allowed
+                               for _, _, found in membership['matches'])
+            frozen_selections[request] = dict(selected_homes=homes, membership=membership,
+                membership_complete=selected['membership_complete'], owners=refs, inaccessible=inaccessible)
+            selection_content[request] = (homes, membership, selected['membership_complete'], inaccessible,
+                [(entry['home'], entry['sid'], entry['revision'], entry['body_digest'],
+                  entry['source_ordinal'], entry.get('owner_lineage')) for entry in refs])
         durable=publication_fingerprint((epoch,stable,meaningful_index,meaningful_revision,activity_digest,
-                                         activities_present))
+                                         activities_present,selection_content))
         envelope=dict(header=json.loads(json.dumps(header,ensure_ascii=False)),sessions=manifest,
                       activities=activity_manifest if activities_present else None)
         return dict(sessions=sessions,activities=activities,envelope=envelope,header=envelope['header'],
                     entries=entries,state_revisions=state_revisions,membership_revision=membership_revision,
+                    selections=frozen_selections,selection_revision=selection_revision,
                     meaningful_revision=meaningful_revision,
                     durable=durable,publication=(epoch,sequence),
                     change_owner=changes.owner if trusted else None,
@@ -324,7 +349,9 @@ class LiveCollection:
 
     def requested_homes(self,now):
         with self.lock:
-            self.leases={key:value for key,value in self.leases.items() if value[1]>=now-60}
+            active={key:value for key,value in self.leases.items() if value[1]>=now-60}
+            if len(active)!=len(self.leases):self.demand_revision+=1
+            self.leases=active
             return list(dict.fromkeys(home for homes,_,_ in self.leases.values() for home in homes))
 
     def requested_demand(self,now):
@@ -333,6 +360,11 @@ class LiveCollection:
             return dict(selected=list(dict.fromkeys(tuple(owner) for value in values for owner in value['selected'])),
                         aggregate=any(value['aggregate'] for value in values),
                         evidence=list(dict.fromkeys(tuple(owner) for value in values for owner in value['evidence'])))
+
+    def requested_selections(self, now):
+        with self.lock:
+            return {selection_request(homes, demand): dict(selected_homes=list(homes), demand=demand)
+                    for homes, observed, demand in self.leases.values() if observed >= now - 60}
 
     def request(self,value):
         if value.get('scope')!=self.scope or not isinstance(value.get('path'),str) or os.path.normcase(value['path'])!=os.path.normcase(self.path):
@@ -345,10 +377,10 @@ class LiveCollection:
                     return dict(error='homes'),b''
                 if value.get('close'):
                     old=self.leases.pop(client,None)
-                    if old is not None and (old[2]['selected'] or old[2]['aggregate'] or old[2]['evidence']):self.demand_revision+=1
+                    if old is not None:self.demand_revision+=1
                     self.changed.notify_all()
                 else:
-                    previous=self.leases.get(client,(None,None,dict(selected=[],aggregate=False,evidence=[])))[2]
+                    prior_homes,_,previous=self.leases.get(client,(None,None,dict(selected=[],aggregate=False,evidence=[])))
                     demand=value.get('demand',previous)
                     if (not isinstance(demand,dict) or type(demand.get('aggregate')) is not bool
                             or any(not isinstance(demand.get(field),list) or any(
@@ -357,9 +389,15 @@ class LiveCollection:
                                 or not isinstance(owner[1],str) for owner in demand[field])
                                 for field in ('selected','evidence'))):
                         return dict(error='demand'),b''
-                    self.leases[client]=(homes,time.time(),demand)
-                    if demand!=previous:self.demand_revision+=1
+                    demand = dict(selected=[list(owner) for owner in dict.fromkeys(map(tuple, demand['selected']))],
+                                  aggregate=demand['aggregate'],
+                                  evidence=[list(owner) for owner in dict.fromkeys(map(tuple, demand['evidence']))])
+                    if value.get('protocol') in (3,4,5):demand['aggregate']=True
+                    self.leases[client]=(list(homes),time.time(),demand)
+                    value = dict(value, demand=demand)
+                    if demand!=previous or homes!=prior_homes:self.demand_revision+=1
             current=self.current
+            revision=self.demand_revision
             recovery=self.recovery
             if value.get('watch')==1:
                 from .collection_transport import NOTIFICATION_WAIT
@@ -378,10 +416,14 @@ class LiveCollection:
         if value.get('header_only'):
             header={key:item for key,item in current['header'].items() if key in STATUS_FIELDS}
             return dict(ready=True,header=header,publication=current['publication']),b''
-        if value.get('protocol')==CATALOG_PROTOCOL:return self.catalog_request(current,value)
+        if value.get('protocol')==CATALOG_PROTOCOL:
+            if value.get('read')=='selection' and current.get('selection_revision')!=revision:
+                return dict(ready=False,protocol=CATALOG_PROTOCOL,error='selected_pending'),b''
+            return self.catalog_request(current,value)
         # Older clients can still use the unchanged durable SQLite schema.
         protocol=value.get('protocol')
         if protocol not in (3,4,5):return dict(ready=False),b''
+        if current['header'].get('catalog_scope')=='selected':return dict(ready=False),b''
         if current['header'].get('activity_stream') and not value.get('activity_stream'):
             return dict(ready=False),b''
         known=value.get('publication')
@@ -436,26 +478,40 @@ class LiveCollection:
             header=current['header']
             complete=bool(header.get('catalog_complete',header.get('usage_collection_complete') and not header.get('index',{}).get('loading'))
                           and allowed.issubset(header.get('homes',[])))
-            if kind=='catalog':
+            if kind in ('catalog','selection'):
+                selected = kind == 'selection'
+                captured = None
+                if selected:
+                    if 'demand' not in value:return fail('selection_request')
+                    request = selection_request(homes, value['demand'])
+                    if value.get('selection_request', request) != request:return fail('selection_request')
+                    captured = current.get('selections', {}).get(request)
+                    if captured is None:return fail('selected_pending')
+                    if captured['inaccessible']:return fail('scope')
+                    complete = captured['membership_complete'] and allowed.issubset(header.get('homes', []))
+                elif header.get('catalog_scope') == 'selected':return fail('selected_pending')
                 offset=value.get('offset',0)
                 if type(offset) is not int or offset<0 or offset and expected_commit is None:return fail('cursor')
                 include=bool(value.get('include_metadata'));entries=[];home_ids={home:position for position,home in enumerate(homes)}
                 metadata_kind=value.get('metadata_kind','full')
-                if metadata_kind not in ('full','lineage'):return fail('metadata_kind')
+                if metadata_kind not in ('full','lineage') or selected and metadata_kind!='lineage':return fail('metadata_kind')
                 membership_format=value.get('membership_format')
-                if membership_format not in (None,'paged-v1'):return fail('membership_format')
-                paged=membership_format=='paged-v1'
-                membership={key:[] for key in ('session_catalog','demand_members') if key in header} if paged else None
+                if membership_format not in (('selected-v1',) if selected else (None,'paged-v1')):return fail('membership_format')
+                paged=membership_format in ('paged-v1','selected-v1')
+                membership_source = captured['membership'] if selected else header
+                membership_keys = ('matches','session_catalog','demand_members') if selected else ('session_catalog','demand_members')
+                membership={key:[] for key in membership_keys if key in membership_source} if paged else None
                 projected={key:item for key,item in header.items() if key not in ('session_catalog','demand_members')} if paged else header
                 metadata_field='owner_lineage' if metadata_kind=='lineage' else 'owner_metadata'
                 result=dict(base,ready=True,header=projected,selected_homes=homes,membership_complete=complete,
                             owner_format='refs-v1',include_metadata=include,metadata_kind=metadata_kind,owners=entries,next_offset=None)
                 if paged:result.update(membership_format=membership_format,membership=membership)
+                if selected:result.update(authority='selected',selection_request=request)
                 if value.get('defer_incomplete') and not complete and not offset:
                     _catalog_weight(result,CATALOG_PAGE_BYTES)
                     return result,b''
-                manifest=current['envelope']['sessions']
-                sections=[(key,header.get(key,())) for key in ('session_catalog','demand_members')] if paged else []
+                manifest=captured['owners'] if selected else current['envelope']['sessions']
+                sections=[(key,membership_source.get(key,())) for key in membership_keys] if paged else []
                 sections.append(('owners',manifest))
                 total=sum(len(rows) for _,rows in sections)
                 if offset>total:return fail('cursor')
@@ -474,6 +530,7 @@ class LiveCollection:
                                 if metadata_kind=='lineage' and envelope is not None and source.get('analysis_proof') is not None:
                                     envelope=dict(envelope,_analysis_proof=source['analysis_proof'])
                                 row.append(envelope)
+                            if selected:row.append(source['source_ordinal'])
                             target=entries
                         else:row=source;target=membership[section]
                         weight=_catalog_weight(row,CATALOG_PAGE_BYTES)+32
@@ -716,12 +773,13 @@ class CollectionChannel(CollectionHeaderReader):
         revision=sequence if changed or restart else getattr(self,'activity_revision',sequence)
         return current,revision,next_revision if writes else highwater
 
-    def publish(self,snapshot,epoch,sequence,*,changes=None):
+    def publish(self,snapshot,epoch,sequence,*,changes=None,selections=None,selection_revision=None):
         self.removed_sessions=()
         if snapshot.get('activity_stream'):
             snapshot={**snapshot,'activity_highwater':getattr(self,'activity_row_revision',0),
                       'activity_live_start':getattr(self,'activity_live_start',0)}
-        candidate=self.live.prepare(snapshot,epoch,sequence,changes=changes) if self.live else None
+        candidate=(self.live.prepare(snapshot,epoch,sequence,changes=changes,selections=selections,
+                                     selection_revision=selection_revision) if self.live else None)
         if candidate is not None and self.live.current is not None and candidate['durable']==self.live.current['durable']:
             candidate['catalog_identity']=self.live.current.get('catalog_identity')
             self.live.publish(candidate)
@@ -1021,7 +1079,7 @@ class CollectionChannel(CollectionHeaderReader):
         response=request(self.companion('.collection-live.json'),
             dict(path=str(self.path),scope=self.scope,client=self.client,homes=self.homes,
                  demand=self.demand,protocol=CATALOG_PROTOCOL,**value),
-            response_limits=(CATALOG_PAGE_BYTES,0 if value.get('read')=='catalog' else SELECTED_BODY_BYTES))
+            response_limits=(CATALOG_PAGE_BYTES,0 if value.get('read') in ('catalog','selection') else SELECTED_BODY_BYTES))
         if response is None:raise CollectionCatalogUnavailable('transport')
         metadata,body=response
         if metadata.get('error')=='scope':raise CollectionScopeError('수집 목록의 범위가 일치하지 않습니다.')
@@ -1040,30 +1098,40 @@ class CollectionChannel(CollectionHeaderReader):
         return dict(catalog_identity=value['catalog_identity'])
 
     def read_catalog(self,*,source='durable',cursor=None,include_metadata=None,defer_incomplete=False,metadata_kind=None,
-                     membership_format='paged-v1'):
+                     membership_format='paged-v1',selection=False):
         """Return owner references without decoding their call history."""
         if source=='live':
             token=self._catalog_token(cursor) if cursor is not None else {}
+            if selection:
+                request=selection_request(self.homes,self.demand)
+                if cursor is not None and cursor.get('selection_request')!=request:
+                    raise CollectionCatalogUnavailable('selection_request')
+                token['selection_request']=request
             include=(cursor['include_metadata'] if cursor is not None else False) if include_metadata is None else bool(include_metadata)
             requested_kind=(cursor.get('metadata_kind','full') if cursor is not None else 'full') if metadata_kind is None else metadata_kind
             if requested_kind not in ('full','lineage'):raise ValueError('Unsupported catalog metadata kind')
             requested_format=cursor.get('membership_format') if cursor is not None else membership_format
-            if requested_format not in (None,'paged-v1'):raise ValueError('Unsupported catalog membership format')
-            metadata,body=self._catalog_request(read='catalog',offset=cursor['offset'] if cursor is not None else 0,
+            if selection:requested_format='selected-v1'
+            if requested_format not in (('selected-v1',) if selection else (None,'paged-v1')):raise ValueError('Unsupported catalog membership format')
+            metadata,body=self._catalog_request(read='selection' if selection else 'catalog',offset=cursor['offset'] if cursor is not None else 0,
                                                include_metadata=include,defer_incomplete=bool(defer_incomplete),metadata_kind=requested_kind,
                                                membership_format=requested_format,**token)
             if body:raise CollectionScopeError('수집 목록에 예상하지 않은 본문이 있습니다.')
             publication=tuple(metadata['publication']);committed=tuple(metadata['catalog_identity'])
-            if token and committed!=tuple(token['catalog_identity']):
+            if 'catalog_identity' in token and committed!=tuple(token['catalog_identity']):
                 raise CollectionCatalogUnavailable('stale')
             base=dict(source='live',scope=self.scope,path=str(self.path),selected_homes=list(self.homes),
                       publication=publication,catalog_identity=committed,include_metadata=include,metadata_kind=requested_kind)
             returned_format=metadata.get('membership_format')
-            if returned_format not in (None,'paged-v1') or returned_format is not None and returned_format!=requested_format:
+            if returned_format not in (('selected-v1',) if selection else (None,'paged-v1')) or returned_format is not None and returned_format!=requested_format:
                 raise CollectionCatalogUnavailable('membership_format')
             if cursor is not None and returned_format!=cursor.get('membership_format'):
                 raise CollectionCatalogUnavailable('membership_format')
             if returned_format is not None:base['membership_format']=returned_format
+            if selection:
+                if metadata.get('authority')!='selected' or metadata.get('selection_request')!=request:
+                    raise CollectionCatalogUnavailable('selection_request')
+                base.update(authority='selected',selection_request=request)
             returned_kind=metadata.get('metadata_kind','full')
             if returned_kind not in ('full','lineage') or returned_kind=='lineage' and requested_kind!='lineage':
                 raise CollectionScopeError('Unexpected catalog metadata kind')
@@ -1071,7 +1139,7 @@ class CollectionChannel(CollectionHeaderReader):
             if metadata.get('owner_format')!='refs-v1':raise CollectionCatalogUnavailable('owner_format')
             owners={}
             for row in metadata['owners']:
-                if len(row)!=(7 if include else 6):raise CollectionScopeError('수집 목록의 형식이 일치하지 않습니다.')
+                if len(row)!=(7 if include else 6)+int(selection):raise CollectionScopeError('수집 목록의 형식이 일치하지 않습니다.')
                 home=self.homes[row[0]]
                 entry=dict(home=home,sid=row[1],revision=row[2],body_digest=row[3],
                     state={CATALOG_STATE[index]:item for index,item in row[4]},metadata_available=row[5])
@@ -1084,18 +1152,24 @@ class CollectionChannel(CollectionHeaderReader):
                                     and all(c in '0123456789abcdef' for c in proof[name]) for name in ('digest','context'))):
                             entry.update(analysis_digest=proof['digest'],display_title=proof['title'],append_context=proof['context'])
                     else:entry['owner_metadata']=row[6]
+                if selection:
+                    if type(row[-1]) is not int or row[-1]<0:raise CollectionScopeError('Invalid selected source position')
+                    entry['source_ordinal']=row[-1]
                 owners[(home,row[1])]=entry
             result=dict(base,header=metadata['header'],membership_complete=metadata['membership_complete'],owners=owners,
                         cursor={**base,'offset':next_offset} if next_offset is not None else None)
             if returned_format is not None:
                 membership=metadata.get('membership')
-                if (not isinstance(membership,dict) or set(membership)-{'session_catalog','demand_members'}
+                fields={'matches','session_catalog','demand_members'} if selection else {'session_catalog','demand_members'}
+                if (not isinstance(membership,dict) or set(membership)-fields
                         or any(not isinstance(rows,list) for rows in membership.values())):
                     raise CollectionScopeError('수집 목록의 멤버십 형식이 일치하지 않습니다.')
                 result['membership']=membership
             return result
-        if source!='durable' or cursor is not None:raise ValueError('Unsupported collection catalog source')
+        if source!='durable' or cursor is not None or selection:raise ValueError('Unsupported collection catalog source')
         result=self.read_owners(())
+        if result is not None and result['catalog']['header'].get('catalog_scope')=='selected':
+            raise CollectionCatalogUnavailable('selected_pending')
         return result['catalog'] if result is not None else None
 
     def read_owners(self,owners,*,catalog=None,encoded=False):
@@ -1328,6 +1402,9 @@ class CollectionChannel(CollectionHeaderReader):
             if not header_only and publication:result=self.activity_page(result,publication[0])
         if result is None:return None
         if header_only:return {key:value for key,value in result.items() if key not in ('sessions','request_activity')}
+        if result.get('catalog_scope')=='selected':
+            result={**result,'catalog_complete':False,'usage_collection_complete':False,
+                    'index':{**result['index'],'loading':True,'usage_complete':False}}
         return {**result,'sessions':list(result['sessions'])} if shared else deepcopy(result)
 
     def close(self):
@@ -1382,7 +1459,7 @@ class CollectionClient:
         if self.waiter is not None:self.waiter.value['demand']=demand
         self.channel.live_request(lease_only=True)
 
-    def request_mode_sources(self,owners):
+    def request_sources(self,owners):
         demand=self.channel.demand
         self.set_demand(demand['selected'],aggregate=demand['aggregate'],
                         evidence=list(dict.fromkeys([tuple(key) for key in demand['evidence']]+list(owners))))
@@ -1476,9 +1553,17 @@ class CollectionClient:
     def poll_catalog(self,now=None,*,cursor=None,include_metadata=None,defer_incomplete=False,metadata_kind=None,
                      membership_format='paged-v1'):
         """One live metadata page; callers stage pages before replacing membership."""
-        now=time.time() if now is None else now
         catalog=self.channel.read_catalog(source='live',cursor=cursor,include_metadata=include_metadata,
                                           defer_incomplete=defer_incomplete,metadata_kind=metadata_kind,membership_format=membership_format)
+        return self._catalog_status(catalog,now)
+
+    def poll_selection(self,now=None,*,cursor=None,include_metadata=True,metadata_kind='lineage'):
+        catalog=self.channel.read_catalog(source='live',cursor=cursor,include_metadata=include_metadata,
+                                          metadata_kind=metadata_kind,selection=True)
+        return self._catalog_status(catalog,now)
+
+    def _catalog_status(self,catalog,now):
+        now=time.time() if now is None else now
         header={**catalog['header']};homes=set(self.channel.homes)
         header['quota_by_home']={home:quota for home,quota in header.get('quota_by_home',{}).items() if home in homes}
         stale=now-header['ts']>30
@@ -1546,6 +1631,8 @@ class CollectorService:
         # Release its view before rebuilding any changed owner.
         self.replay_snapshot=None
         if self.index and self.index.replay:self.index.replay.capture_snapshot=None
+        # A lease change during source collection must wait for its next captured selection.
+        with self.channel.live.lock:selection_revision=self.channel.live.demand_revision
         now=now or time.time();homes=self.channel.requested_homes(now)
         if self.index and homes!=[str(h) for h in self.index.homes]:
             self.index.close();self.index=None;self.epoch=uuid.uuid4().hex
@@ -1555,6 +1642,7 @@ class CollectorService:
             from .collection_replay import CollectionReplay
             self.index.replay=CollectionReplay.open(self.channel,self.index,restore_metadata=False)
         demand=self.channel.live.requested_demand(now)
+        requests=self.channel.live.requested_selections(now)
         if detailed:demand['aggregate']=True
         self.index.demand=demand
         snapshot=(self.index.poll(now) if source_hint is None else
@@ -1566,7 +1654,11 @@ class CollectorService:
         snapshot={**snapshot,'sessions':[self.with_epoch(s) for s in snapshot['sessions']],
             'collection':dict(pid=os.getpid(),instance=self.instance,version=VERSION,
                 executable=self.executable)}
-        self.sequence+=1;self.channel.publish(snapshot,self.epoch,self.sequence,changes=changes)
+        selections = {request: dict(self.index.resolve_selection(value['demand']['selected'],
+                          evidence=value['demand']['evidence']), selected_homes=value['selected_homes'])
+                      for request, value in requests.items()}
+        self.sequence+=1;self.channel.publish(snapshot,self.epoch,self.sequence,changes=changes,selections=selections,
+                                             selection_revision=selection_revision)
         if self.index.replay is not None and self.index.replay.capture(source_snapshot,now):
             self.replay_snapshot=source_snapshot
         published_sessions=snapshot['sessions']

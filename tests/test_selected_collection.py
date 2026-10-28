@@ -37,10 +37,8 @@ def thread(home, sid, parent=None):
     path.write_text(json.dumps(event('session_meta', id=sid, parent_thread_id=parent)) + '\n'
                     + json.dumps(usage('response-' + sid, tid=sid)) + '\n', encoding='utf8')
     with sqlite3.connect(home / 'state_5.sqlite') as db:
-        if 'parent_thread_id' not in {row[1] for row in db.execute('PRAGMA table_info(threads)')}:
-            db.execute('ALTER TABLE threads ADD COLUMN parent_thread_id TEXT')
-        db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?)',
-                   (sid, str(path), 10000, None, sid, 'test', 'openai', 'project', parent))
+        db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?)',
+                   (sid, str(path), 10000, None, sid, 'test', 'openai', 'project'))
     return path
 
 
@@ -275,11 +273,12 @@ def test_selected_pages_keep_frozen_positions_with_an_aggregate_lease(collector,
     monkeypatch.setattr(collection, 'CATALOG_PAGE_ROWS', 2)
     try:
         aggregate.set_demand([], aggregate=True)
-        reader.set_demand([(None, TID)])
+        reader.set_demand([(None, OTHER)])
         collect(service)
         manifest = service.channel.live.current['envelope']['sessions']
         expected = {(entry['home'], entry['sid']): position for position, entry in enumerate(manifest)
-                    if entry['sid'] in (TID, CHILD)}
+                    if entry['sid'] == OTHER}
+        assert min(expected.values()) > 0
         with monkeypatch.context() as patch:
             patch.setattr(service.index, 'resolve_selection', lambda *a, **kw: pytest.fail('handler read writer state'))
             patch.setattr(reader, 'poll_catalog', lambda **kw: pytest.fail('selected client requested full catalog'))
@@ -349,23 +348,26 @@ def test_selected_mode_context_preserves_family_and_body_parent_roles(collector)
     service, reader, home = collector
     reader.set_demand([(None, TID)])
     collect(service)
-    with sqlite3.connect(home / 'state_5.sqlite') as db:
-        db.execute('UPDATE threads SET parent_thread_id=? WHERE id=?', (OTHER, CHILD))
-    service.index.refresh_metadata({home.resolve()})
+    child_path = home / 'sessions' / (CHILD + '.jsonl')
+    with child_path.open('a', encoding='utf8') as stream:
+        stream.write(json.dumps(event('session_meta', id=CHILD, parent_thread_id=OTHER)) + '\n')
+    service.index.scan_file(str(child_path), home, CHILD)
+    service.index.db.commit()
+    reader.set_demand([(None, OTHER)])
     collect(service)
     pages = selected_pages(reader)
     membership = [row for page in pages for row in page['membership']['session_catalog']]
     family = [row for page in pages for row in page['membership']['demand_members']]
     refs = {key: value for page in pages for key, value in page['owners'].items()}
-    assert [str(home), CHILD, TID] in membership
-    assert [str(home), OTHER, None] in membership
-    assert [str(home), CHILD] in family and [str(home), OTHER] not in family
-    assert refs[(str(home), CHILD)]['owner_lineage']['parent_thread_id'] == OTHER
-    reader.request_sources([(str(home), OTHER)])
+    assert [str(home), CHILD, OTHER] in membership
+    assert [str(home), TID, None] in membership
+    assert [str(home), CHILD] in family and [str(home), TID] not in family
+    assert refs[(str(home), CHILD)]['owner_lineage']['parent_thread_id'] == TID
+    reader.request_sources([(str(home), TID)])
     collect(service)
     expanded = selected_pages(reader)
-    assert (str(home), OTHER) in {key for page in expanded for key in page['owners']}
-    assert [str(home), OTHER] not in [row for page in expanded for row in page['membership']['demand_members']]
+    assert (str(home), TID) in {key for page in expanded for key in page['owners']}
+    assert [str(home), TID] not in [row for page in expanded for row in page['membership']['demand_members']]
 
 
 def test_modern_selected_capability_failure_never_reads_full_catalog(collector, monkeypatch):
@@ -410,6 +412,55 @@ def test_selected_wildcards_use_global_homes_but_bodies_keep_client_scope(collec
         other.close()
 
 
+def test_full_readers_remain_pending_until_an_aggregate_publication(collector):
+    service, reader, home = collector
+    reader.set_demand([(None, TID)])
+    collect(service)
+    with pytest.raises(collection.CollectionCatalogUnavailable, match='selected_pending'):
+        reader.poll_catalog(10010)
+    recovered = reader.channel.read(shared=True)
+    assert not recovered['catalog_complete'] and recovered['index']['loading']
+    for protocol in (3, 4, 5):
+        metadata, body = service.channel.live.request(dict(path=str(service.channel.path),
+            scope=service.channel.scope, client='legacy', homes=[str(home)], protocol=protocol,
+            activity_stream=True))
+        assert metadata['ready'] is False and body == b''
+    collect(service)
+    catalog = reader.poll_catalog(10010)
+    assert catalog['membership_complete']
+    assert {sid for _, sid in catalog['owners']} == {TID, CHILD, OTHER}
+
+
+def test_selected_scope_changes_during_collection_wait_for_the_next_publication(collector, tmp_path, monkeypatch):
+    service, reader, home = collector
+    reader.set_demand([(None, TID)])
+    collect(service)
+    root = tmp_path / 'second'
+    root.mkdir()
+    other_home, _ = fixture_home(root)
+    other = collection.CollectionClient([other_home], service.channel.path, service.channel.evidence)
+    original = service.index.poll
+
+    def change_scope(*args, **kwargs):
+        snapshot = original(*args, **kwargs)
+        other.set_demand([], aggregate=True)
+        return snapshot
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(service.index, 'poll', change_scope)
+            collect(service)
+        with pytest.raises(collection.CollectionCatalogUnavailable, match='selected_pending'):
+            reader.poll_selection(10010)
+        collect(service)
+        pages = selected_pages(reader)
+        assert [row for page in pages for row in page['membership']['matches']] == [
+            [None, TID, [str(home), str(other_home)]],
+        ]
+        assert all(not page['membership']['demand_members'] for page in pages)
+    finally:
+        other.close()
+
 def test_selected_known_unavailable_source_never_becomes_absent(collector, monkeypatch):
     import io
 
@@ -434,19 +485,24 @@ def test_selected_known_unavailable_source_never_becomes_absent(collector, monke
 
 def test_selected_context_captures_the_whole_path_entering_a_mode_cycle(collector):
     service, reader, home = collector
-    thread(home, 'cycle', OTHER)
+    thread(home, 'cycle', TID)
+    root_path = home / 'session.jsonl'
+    root_path.write_text(json.dumps(event('session_meta', id=TID, parent_thread_id='cycle')) + '\n'
+                         + root_path.read_text(encoding='utf8'), encoding='utf8')
     reader.set_demand([(None, TID)])
     collect(service)
-    with sqlite3.connect(home / 'state_5.sqlite') as db:
-        db.execute('UPDATE threads SET parent_thread_id=? WHERE id=?', (OTHER, CHILD))
-        db.execute('UPDATE threads SET parent_thread_id=? WHERE id=?', ('cycle', OTHER))
-    service.index.refresh_metadata({home.resolve()})
+    child_path = home / 'sessions' / (CHILD + '.jsonl')
+    with child_path.open('a', encoding='utf8') as stream:
+        stream.write(json.dumps(event('session_meta', id=CHILD, parent_thread_id=OTHER)) + '\n')
+    service.index.scan_file(str(child_path), home, CHILD)
+    service.index.db.commit()
+    reader.set_demand([(None, OTHER)])
     collect(service)
     pages = selected_pages(reader)
     context = {tuple(row) for page in pages for row in page['membership']['session_catalog']}
-    assert {(str(home), OTHER, 'cycle'), (str(home), 'cycle', OTHER)} <= context
+    assert {(str(home), TID, 'cycle'), (str(home), 'cycle', TID)} <= context
     refs = {key: entry for page in pages for key, entry in page['owners'].items()}
-    assert refs[(str(home), CHILD)]['owner_lineage']['parent_thread_id'] == OTHER
+    assert refs[(str(home), CHILD)]['owner_lineage']['parent_thread_id'] == TID
     assert {tuple(row) for page in pages for row in page['membership']['demand_members']} == {
-        (str(home), TID), (str(home), CHILD),
+        (str(home), OTHER), (str(home), CHILD),
     }

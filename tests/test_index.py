@@ -1268,7 +1268,10 @@ def test_cancelling_selection_keeps_header_discovery_without_loading_child_histo
     index.demand=dict(selected=[],aggregate=False,evidence=[])
     idle=finish(index)
     assert idle['catalog_complete'] and idle['usage_collection_complete'] and not idle['sessions']
-    assert [str(home.resolve()),sid,TID] in idle['session_catalog']
+    assert idle['session_catalog']==[]
+    selected=index.resolve_selection([(None,TID)])
+    assert selected['membership_complete']
+    assert [str(home.resolve()),sid,TID] in selected['session_catalog']
     assert idle['demand_members']==[]
     assert index.db.execute('SELECT count(*) FROM events WHERE tid=?',(sid,)).fetchone()[0]==0
     index.demand=dict(selected=[(None,TID)],aggregate=False,evidence=[])
