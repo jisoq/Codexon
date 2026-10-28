@@ -446,6 +446,23 @@ def test_completed_target_resolution_clears_preparation_without_session_bodies(o
     assert controller.content()==(None,notice)
 
 
+@pytest.mark.parametrize('count',[0,1,2])
+@pytest.mark.parametrize('stale',[False,True])
+def test_compact_target_resolution_preserves_preparation_policy(overlay_cache_controller,count,stale):
+    controller,_ = overlay_cache_controller
+    controller.receive_target({'selection':Selection(A)})
+    pending = controller.preparation
+    controller.receive_snapshot(dict(overlay_sessions=[],catalog_complete=True,collection_stale=stale,
+        demand=dict(selected=[[None,A]],aggregate=False,evidence=[]),
+        selected_resolutions=[[A,count]],index=dict(loading=False)))
+    assert controller.target_resolution == (None if stale else (A,count))
+    if stale or count==1:
+        assert controller.preparation is pending
+    else:
+        assert controller.preparation is None
+        assert controller.content() == (None,'호출 기록 없음' if count==0 else '현재 세션 식별 불가')
+
+
 @pytest.mark.parametrize('change',[
     dict(catalog_complete=False),dict(collection_stale=True),dict(collection_recovery=True),
     dict(demand=dict(selected=[[None,B]],aggregate=False,evidence=[])),

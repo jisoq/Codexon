@@ -2271,6 +2271,8 @@ def test_paged_catalog_resolves_selection_against_late_unloaded_membership(tmp_p
     assert list(catalog['owners']) == ([] if ambiguous else [selected])
     assert set(catalog['selected_members']) == (set() if ambiguous else {selected})
     assert list(catalog['mode_sources']) == ([selected] if ambiguous else [])
+    assert catalog['header']['selected_resolutions'] == [[selected[1],2 if ambiguous else 1]]
+    assert 'session_catalog' not in catalog['header']
 
 
 def test_incomplete_catalog_exposes_status_without_partial_membership(tmp_path):
