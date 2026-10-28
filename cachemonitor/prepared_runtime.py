@@ -281,31 +281,35 @@ class PreparedWriter:
                     return
                 value=dict(snapshot,mismatch_history=archive.health(),ledger_status_known=(imported and not ledger_pending) or ledger is None,
                            ledger_fault=dict(ledger_failed=bool(ledger_issue)))
-                if ledger_issue:
-                    value['ledger_error']=ledger_issue
-                else:
-                    value.pop('ledger_error',None)
-                # Publication never reads retained calls. Its summaries and
-                # choices are prepared by the source writer's committed cohort.
+                if ledger_issue:value['ledger_error']=ledger_issue
+                else:value.pop('ledger_error',None)
                 active=cycle or StageTimings()
+                frames=None
                 try:
-                    if pending_reset:
-                        publisher.reset()
-                    with active.measure('publication'):
-                        light=publisher.publish(value,store,speed_writer.results)
-                    active.counts['generation']=store.token.generation
-                    active.counts['publications']=active.counts.get('publications',0)+1
-                    for name,field in (('session_delta','sessions'),('overlay_delta','overlay_sessions'),('removed_delta','removed')):
-                        active.counts[name]=active.counts.get(name,0)+len(light.get(field,()))
-                    light['analysis_timing']=active.snapshot()
-                    with active.measure('publication_queue'):
-                        delivered=self.output.put(dict(kind='snapshot',value=light,token=tuple_token(store.token),
-                                                       transition=delivery_delta))
-                        if delivered:initial=False
+                    if pending_reset:publisher.reset()
+                    frames=iter(publisher.publish_pages(value,store,speed_writer.results))
+                    first=True
+                    while True:
+                        with active.measure('publication'):
+                            try:light=next(frames)
+                            except StopIteration:break
+                        active.counts['generation']=store.token.generation
+                        if first:
+                            active.counts['publications']=active.counts.get('publications',0)+1
+                            first=False
+                        for name,field in (('session_delta','sessions'),('overlay_delta','overlay_sessions'),('removed_delta','removed')):
+                            active.counts[name]=active.counts.get(name,0)+len(light.get(field,()))
+                        light['analysis_timing']=active.snapshot()
+                        with active.measure('publication_queue'):
+                            delivered=self.output.put(dict(kind='snapshot',value=light,token=tuple_token(store.token),
+                                transition=None if light.get('more') else delivery_delta))
+                            if delivered:initial=False
+                            else:break
                 except CapacityExceeded as error:
                     publication_failed(error)
                     return
                 finally:
+                    if frames is not None:frames.close()
                     if cycle is None:timing(active)
                 delivery_delta=None
                 pending_reset=False
@@ -575,11 +579,13 @@ class PreparedWriter:
                             previous=publisher.token
                             with cycle.measure('publication_adopt'):
                                 if blocked_publication!=store.token:
-                                    try:publisher.adopt(store,pending_changed,pending_removed)
+                                    try:publisher.adopt(store,pending_changed,pending_removed,
+                                        selected=catalog['selected_members'] if catalog['header'].get('demand') is not None else None)
                                     except CapacityExceeded as error:publication_failed(error)
                             if previous!=store.token and publisher.token==store.token:
-                                delivery_delta=(tuple_token(previous) if previous else None,
-                                                tuple_token(store.token),tuple(pending_changed),tuple(pending_removed))
+                                delivery_delta=((tuple_token(previous),tuple_token(store.token),
+                                    tuple(pending_changed),tuple(pending_removed)) if previous is not None and
+                                    len(pending_changed)+len(pending_removed)<=store.limits.owners_per_batch else None)
                             publisher.cache_floor=self.cache_floor
                             with cycle.measure('activity_page'):
                                 snapshot=collector.channel.activity_page(dict(catalog['header']),catalog['publication'][0],
@@ -751,9 +757,11 @@ def process_main(connection,homes,index_path,model_evidence_path,quota_path,cach
                 if message['kind']=='fatal':
                     connection.send(message);return None
                 if message['kind']=='snapshot':
-                    current=token_value(message.pop('token'))
-                    aggregate_ready=message['value'].get('aggregate_request')
-                    journal.add(message.pop('transition'))
+                    token=message.pop('token');transition=message.pop('transition')
+                    if not message['value'].get('more'):
+                        current=token_value(token)
+                        aggregate_ready=message['value'].get('aggregate_request')
+                        journal.add(transition)
                 connection.send(message)
             for completed_actor in (actor,detail_actor):
                 if completed_actor.notification not in ready:continue
