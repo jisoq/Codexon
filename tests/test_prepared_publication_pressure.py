@@ -87,8 +87,10 @@ def test_startup_collection_counts_are_sampled_and_unavailable_catalog_is_unmeas
     monkeypatch.setattr(prepared_runtime.Mailbox,'offer_progress',offer)
     monkeypatch.setattr(prepared_runtime,'time',SimpleNamespace(monotonic=lambda:clock[0],time=time.time))
     channel=CollectionChannel([tmp_path/'home'],tmp_path/'source.sqlite');channel.start_live()
-    snapshot=empty_snapshot(channel.homes,channel.path,time.time());snapshot['index'].update(done=1,files=10)
+    snapshot=empty_snapshot(channel.homes,channel.path,time.time());snapshot['catalog_scope']='full'
+    snapshot['index'].update(done=1,files=10)
     writer=PreparedWriter(channel.homes,channel.path,None,tmp_path/'quota.sqlite')
+    writer.set_aggregate('publication-pressure')
     try:
         requested.get(timeout=10)
         samples.put('unavailable');writer.sync();requested.get(timeout=5)
@@ -135,10 +137,11 @@ def test_writer_survives_publication_capacity_and_recovers_on_sync(tmp_path,monk
     channel.start_live()
     snapshot=empty_snapshot(channel.homes,channel.path,time.time())
     value=source();value['home']=channel.homes[0]
-    snapshot.update(sessions=[value],usage_collection_complete=True,request_activity=[],quota_by_home={})
+    snapshot.update(sessions=[value],catalog_scope='full',usage_collection_complete=True,request_activity=[],quota_by_home={})
     snapshot['index'].update(loading=False,usage_complete=True)
     channel.publish(snapshot,'pressure',1)
     writer=PreparedWriter(channel.homes,channel.path,None,tmp_path/'quota.sqlite')
+    writer.set_aggregate('publication-pressure')
     def receive(kind):
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
@@ -187,10 +190,11 @@ def test_warning_completion_preserves_failed_canonical_adoption(tmp_path,monkeyp
     channel.start_live()
     snapshot=empty_snapshot(channel.homes,channel.path,time.time())
     value=source();value['home']=channel.homes[0]
-    snapshot.update(sessions=[value],usage_collection_complete=True,request_activity=[],quota_by_home={})
+    snapshot.update(sessions=[value],catalog_scope='full',usage_collection_complete=True,request_activity=[],quota_by_home={})
     snapshot['index'].update(loading=False,usage_complete=True)
     channel.publish(snapshot,'pressure',1)
     writer=PreparedWriter(channel.homes,channel.path,None,tmp_path/'quota.sqlite')
+    writer.set_aggregate('publication-pressure')
     def receive(predicate):
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:

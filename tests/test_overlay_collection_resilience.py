@@ -31,7 +31,7 @@ class PreparedAnalysis:
     def publish(self,*,at=None,errors=()):
         self.sequence+=1
         value=empty_snapshot(self.channel.homes,self.channel.path,self.at if at is None else at)
-        value.update(sessions=[copy.deepcopy(self.session)],usage_collection_complete=True,
+        value.update(sessions=[copy.deepcopy(self.session)],catalog_scope='full',usage_collection_complete=True,
                      last_usage_collection_success=value['ts'],request_activity=[],quota_by_home={},errors=list(errors))
         value['index'].update(loading=False,usage_complete=True,last_usage_success=value['ts'])
         self.channel.publish(value,'prepared-test',self.sequence)
@@ -83,7 +83,10 @@ class PreparedAnalysis:
         assert overlay['latest']['key']==history[-1]['key']
 
     def __enter__(self):
-        self.publish();self.thread.start();return self
+        self.publish()
+        self.parent.send(dict(kind='query',id='fixture-aggregate',logical='fixture-aggregate',
+            query=dict(page=2,start=0,end=self.at,now=self.at,period='custom',include_whole_history=False)))
+        self.thread.start();return self
 
     def __exit__(self,*exc):
         try:
