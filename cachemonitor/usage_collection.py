@@ -1631,7 +1631,6 @@ class CollectorService:
         # Release its view before rebuilding any changed owner.
         self.replay_snapshot=None
         if self.index and self.index.replay:self.index.replay.capture_snapshot=None
-        # A lease change during source collection must wait for its next captured selection.
         with self.channel.live.lock:selection_revision=self.channel.live.demand_revision
         now=now or time.time();homes=self.channel.requested_homes(now)
         if self.index and homes!=[str(h) for h in self.index.homes]:
