@@ -123,7 +123,6 @@ class ObservationBacklog:
             self.journal_room(db)
             count, size = db.execute(
                 'select items,bytes from budget where id=1').fetchone()
-            # Leave polling headroom while recovery drains queued observations.
             if count >= self.MAX_ITEMS or size + self.OBSERVATION_RESERVE_BYTES > self.MAX_BYTES:
                 self.issue = '한도 관측 복구 대기 공간이 가득 찼습니다. 저장 복구까지 새 조회를 중지합니다.'
                 return False

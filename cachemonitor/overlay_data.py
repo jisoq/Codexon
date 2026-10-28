@@ -445,8 +445,6 @@ def summarize_session(session,health=None,*,_partials=None,_facts=None):
     if not incidents and health.get('incident'):
         incidents=[health['incident']]
     degradation=[event for event in incidents if event.get('state')=='캐시 저하 의심']
-    # Keep classifier evidence available after the graph's recent-call window rolls
-    # forward. These are observed rows, never reconstructed from session totals.
     evidence_rows={}
     evidence_keys=set()
     for event in degradation:

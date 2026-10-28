@@ -421,7 +421,6 @@ class LiveCollection:
                     **(dict(full=full) if protocol in (4,5) else {})),b''.join(chunks)
 
     def catalog_request(self,current,value):
-        """Slice the existing immutable publication; never populate another catalog."""
         publication=current['publication'];committed=current.get('catalog_identity')
         base=dict(protocol=CATALOG_PROTOCOL,publication=publication,catalog_identity=committed)
         def fail(reason):return dict(base,ready=False,error=reason),b''
@@ -452,7 +451,6 @@ class LiveCollection:
                 result=dict(base,ready=True,header=projected,selected_homes=homes,membership_complete=complete,
                             owner_format='refs-v1',include_metadata=include,metadata_kind=metadata_kind,owners=entries,next_offset=None)
                 if paged:result.update(membership_format=membership_format,membership=membership)
-                # Source recovery cannot establish or withdraw membership.
                 if value.get('defer_incomplete') and not complete and not offset:
                     _catalog_weight(result,CATALOG_PAGE_BYTES)
                     return result,b''
@@ -522,7 +520,6 @@ class LiveCollection:
                         not all(isinstance(part,str) for part in key) for key in requested)):return fail('request')
             keys=[tuple(key) for key in requested]
             if len(set(keys))!=len(keys) or any(key[0] not in allowed for key in keys):return fail('scope')
-            # Admit the complete selected transfer before copying any payload.
             if any(key not in current['entries'] for key in keys):return fail('missing')
             total=sum(len(current['sessions'][key][2]) for key in keys)
             if total>SELECTED_BODY_BYTES:return fail('body_budget')
