@@ -2186,3 +2186,107 @@ def test_catalog_order_streams_complete_membership_past_page_scratch(tmp_path):
         with store.read_current() as view:
             assert [row['owner'] for row in pages(view.ordering)] == expected
             assert [view.owner(*owner)['owner_ordinal'] for owner in expected] == list(range(len(owners)))
+
+
+def catalog_page_client(session_rows, owner_keys, *, selected, paged=True):
+    from types import SimpleNamespace
+
+    parents = {(home, sid): parent for home, sid, parent in session_rows}
+    demand = dict(selected=selected, aggregate=False)
+    header = dict(ts=100, homes=['home', 'other-home'], demand=demand,
+                  catalog_complete=True, usage_collection_complete=True,
+                  index=dict(loading=False, usage_complete=True))
+    entries = {owner: dict(home=owner[0], sid=owner[1], revision=1,
+                          body_digest=f'{ordinal+1:064x}',
+                          state=dict(collection_complete=True), metadata_available=True,
+                          owner_lineage=dict(parent_thread_id=parents.get(owner)))
+               for ordinal, owner in enumerate(owner_keys)}
+    base = dict(source='live', scope='scope', path='index.sqlite',
+                selected_homes=['home', 'other-home'], publication=('source', 1),
+                catalog_identity=('source', 1), header=header,
+                membership_complete=True, include_metadata=True, metadata_kind='lineage')
+    pages = []
+    if paged:
+        for start in range(0, len(session_rows), 7):
+            pages.append(dict(base, membership_format='paged-v1', owners={},
+                membership=dict(session_catalog=session_rows[start:start+7], demand_members=[])))
+        for start in range(0, len(owner_keys), 7):
+            pages.append(dict(base, membership_format='paged-v1', owners={},
+                membership=dict(session_catalog=[], demand_members=[list(key) for key in owner_keys[start:start+7]])))
+    else:
+        header.update(session_catalog=session_rows, demand_members=[list(key) for key in owner_keys])
+    for start in range(0, len(owner_keys), 3):
+        page = dict(base, owners={owner: entries[owner] for owner in owner_keys[start:start+3]})
+        if paged:
+            page.update(membership_format='paged-v1', membership=dict(session_catalog=[], demand_members=[]))
+        pages.append(page)
+    if not pages:
+        pages.append(dict(base, owners={}))
+    for ordinal, page in enumerate(pages):
+        page['cursor'] = ('page', ordinal+1) if ordinal+1 < len(pages) else None
+
+    def poll_catalog(*, cursor=None, **kwargs):
+        return pages[0 if cursor is None else cursor[1]]
+
+    def selected_owner_stream(*args, **kwargs):
+        raise AssertionError('complete catalog lineage must not load source bodies')
+
+    return SimpleNamespace(poll_catalog=poll_catalog, active_demand=demand,
+                           selected_owner_stream=selected_owner_stream, pages=pages)
+
+
+@pytest.mark.parametrize('paged', [False, True])
+def test_complete_catalog_exceeds_old_admission_and_preserves_selected_family(tmp_path, paged):
+    from cachemonitor.prepared_ingest import IngestLimits, mode_context, mode_parent_index, read_catalog
+
+    parent, selected, child = (('home', name) for name in ('parent', 'selected', 'child'))
+    unrelated = [('home', f'unrelated-{number:03d}-'+('x'*128)) for number in range(40)]
+    owners = [child, parent, *unrelated, selected]
+    rows = [(*owner, None) for owner in unrelated]
+    rows.extend([(*selected, parent[1]), (*child, selected[1]), (*parent, None)])
+    client = catalog_page_client(rows, owners, selected=[[None, selected[1]]], paged=paged)
+    catalog = read_catalog(client, limits=replace(IngestLimits(), catalog_bytes=16*1024))
+    assert catalog['membership_complete']
+    assert list(catalog['owners']) == [child, selected]
+    assert [entry['source_ordinal'] for entry in catalog['owners'].values()] == [0, 1]
+    assert set(catalog['selected_members']) == {selected, child}
+    assert len(catalog['mode_sources']) == len(unrelated)+1
+    parents = mode_parent_index(catalog)
+    assert mode_context(selected, catalog, parents=parents) == (parent, selected)
+    assert mode_context(child, catalog, parents=parents) == (parent, selected, child)
+
+
+@pytest.mark.parametrize('ambiguous', [False, True])
+def test_paged_catalog_resolves_selection_against_late_unloaded_membership(tmp_path, ambiguous):
+    from cachemonitor.prepared_ingest import read_catalog
+
+    selected = ('home', 'selected')
+    rows = [(*selected, None)]
+    if ambiguous:
+        rows.extend(('other-home', f'unloaded-{number}', None) for number in range(8))
+        rows.append(('other-home', selected[1], None))
+    client = catalog_page_client(rows, [selected], selected=[[None, selected[1]]])
+    catalog = read_catalog(client)
+    assert catalog['membership_complete']
+    assert list(catalog['owners']) == ([] if ambiguous else [selected])
+    assert set(catalog['selected_members']) == (set() if ambiguous else {selected})
+    assert list(catalog['mode_sources']) == ([selected] if ambiguous else [])
+
+
+def test_incomplete_catalog_exposes_status_without_partial_membership(tmp_path):
+    from cachemonitor.prepared_ingest import read_catalog
+
+    selected = ('home', 'selected')
+    client = catalog_page_client([(*selected, None)], [selected], selected=[[None, selected[1]]])
+    client.pages[-1]['membership_complete'] = False
+    path = tmp_path/'catalog-interrupted.sqlite'
+    with storage.PreparedStore(path) as store:
+        previous = publish(store, 1, calls())
+        pending = read_catalog(client)
+        assert pending['membership_complete'] is False
+        assert not pending['owners']
+        assert 'membership' not in pending
+        assert not {'session_catalog', 'demand_members'}.intersection(pending['header'])
+        assert store.token == previous
+        with store.read_current() as view:
+            assert view.record(*OWNER, 'call-0')['cost'] == 1.
