@@ -368,8 +368,15 @@ class UsageIndex:
         except FileNotFoundError:
             self.header_pending.discard(path)
             return tid
-        except (OSError,ValueError,TypeError):
-            if signature is not None:self.partial_work[path]=dict(signature=signature,header_pending=True,error=True)
+        except (OSError,ValueError,TypeError) as error:
+            if isinstance(error,OSError) and tid:
+                # The app catalog establishes this owner. Its unavailable source
+                # blocks that owner without withdrawing unrelated ready owners.
+                self.header_pending.discard(path)
+                partial=self.partial_work.get(path)
+                if partial is not None and partial.get('header_pending'):self.partial_work.pop(path)
+            elif signature is not None:
+                self.partial_work[path]=dict(signature=signature,header_pending=True,error=True)
             self.failed_sources.add((str(home),tid))
             self.errors.append(f'기록 머리말 확인 필요: {Path(path).name}')
             self.collection_fault['read_failed']=True

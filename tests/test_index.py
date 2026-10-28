@@ -1350,3 +1350,27 @@ def test_replaced_indexed_header_replaces_persisted_lineage_before_reopen(tmp_pa
             assert {row['key'] for row in analyze(complete['sessions'])['responses']}=={'r1','replacement'}
             if reopened:assert index.bytes_read==0
         finally:index.close()
+
+
+@pytest.mark.parametrize('catalogued',[False,True],ids=['unknown-owner','catalogued-owner'])
+def test_unavailable_header_preserves_known_membership_and_reports_source_failure_each_poll(tmp_path,monkeypatch,catalogued):
+    import io
+    home,_=fixture_home(tmp_path)
+    path,sid=discovery_child(home,0,catalogued=catalogued)
+    original=io.open
+    def source_open(filename,*args,**kwargs):
+        if Path(filename)==path:raise PermissionError('Source is unavailable')
+        return original(filename,*args,**kwargs)
+    monkeypatch.setattr(io,'open',source_open)
+    index=UsageIndex([home],tmp_path/'index.sqlite')
+    index.demand=dict(selected=[(None,TID)],aggregate=True,evidence=[])
+    try:
+        for _ in range(3):
+            value=index.poll(10010)
+            assert value['usage_errors'] and value['collection_fault']['read_failed']
+            assert not value['usage_collection_complete']
+            assert value['catalog_complete'] is catalogued
+            selected=next(session for session in value['sessions'] if session['id']==TID)
+            assert selected['collection_complete'] is catalogued
+            assert [row['key'] for row in selected['history']]==['r1']
+    finally:index.close()
