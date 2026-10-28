@@ -70,3 +70,62 @@ def test_default_catalog_accepts_more_than_the_retired_32mib_owner_tree(tmp_path
             catalog.close()
         with pytest.raises(PreparedError):
             len(catalog['owners'])
+
+
+@pytest.mark.parametrize('cancel_inside_sql',[True,False],ids=['cancel','complete'])
+def test_catalog_finish_scopes_sql_cancellation_and_preserves_previous_membership(tmp_path,cancel_inside_sql):
+    class ExecutingConnection:
+        def __init__(self,connection):
+            self.connection=connection
+            self.executing=False
+
+        def execute(self,*args,**kwargs):
+            self.executing=True
+            try:return self.connection.execute(*args,**kwargs)
+            finally:self.executing=False
+
+        def __getattr__(self,name):
+            return getattr(self.connection,name)
+
+    home=str(tmp_path/'home')
+    with PreparedStore(tmp_path/'prepared.sqlite') as store:
+        previous_client=CatalogPages(home,2)
+        previous=read_catalog(previous_client,store=store)
+        connection=store.db
+        probe=ExecutingConnection(connection)
+        store.db=probe
+        incoming=None
+        armed=cancel_inside_sql
+        cancelled=False
+        sql_cancellations=0
+
+        def cancel():
+            nonlocal cancelled,sql_cancellations
+            if armed and probe.executing:
+                sql_cancellations+=1
+                cancelled=True
+            return cancelled
+
+        try:
+            client=CatalogPages(home,512)
+            if cancel_inside_sql:
+                with pytest.raises(InterruptedError,match='cancelled'):
+                    incoming=read_catalog(client,store=store,cancel=cancel)
+                assert sql_cancellations>0
+            else:
+                incoming=read_catalog(client,store=store,cancel=cancel)
+                assert list(incoming['owners']) == [client.selected]
+                assert incoming['membership_complete']
+
+            armed=True
+            total=probe.execute('WITH RECURSIVE values_to_sum(value) AS ('
+                'VALUES(1) UNION ALL SELECT value+1 FROM values_to_sum WHERE value<2000) '
+                'SELECT sum(value) FROM values_to_sum').fetchone()[0]
+            assert total == 2_001_000
+            assert list(previous['owners']) == [previous_client.selected]
+            assert set(previous['selected_members']) == {previous_client.selected}
+            assert previous['membership_complete']
+        finally:
+            if incoming is not None:incoming.close()
+            store.db=connection
+            previous.close()
