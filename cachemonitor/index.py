@@ -354,6 +354,7 @@ class UsageIndex:
         try:
             st=Path(path).stat();signature=(st.st_size,st.st_mtime_ns,str(st.st_ino))
             state=self.source_work.get(path)
+            known_empty=bool(tid) and st.st_size==0
             saved=self.db.execute('SELECT home,tid,offset,size,mtime,inode FROM files WHERE path=?',(path,)).fetchone()
             if (saved is not None and saved[0]==str(home) and saved[1] and saved[2]>0
                     and (tid is None or saved[1]==tid) and tuple(saved[3:])==signature
@@ -362,7 +363,7 @@ class UsageIndex:
                 return saved[1]
             partial=self.partial_work.get(path)
             if partial is not None and partial.get('header_pending'):
-                if partial['signature']==signature:
+                if partial['signature']==signature and not known_empty:
                     if partial.get('error'):raise ValueError('Invalid source header')
                     return tid
                 self.partial_work.pop(path)
@@ -376,7 +377,9 @@ class UsageIndex:
                 try:record=next(reader.read(source,FILE_READ_BUDGET,first_record=True),None)
                 finally:self.bytes_read+=reader.bytes_read-before
             if not reader.committed:
-                if reader.read_offset>=st.st_size:
+                if known_empty and reader.read_offset==0:
+                    self.header_pending.discard(path)
+                elif reader.read_offset>=st.st_size:
                     self.partial_work[path]=dict(signature=signature,header_pending=True)
                 return tid
             header=json.loads(record[1]) if record is not None else None

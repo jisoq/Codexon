@@ -277,14 +277,8 @@ def test_closed_collection_reuses_bodies_and_replays_only_changed_owners(tmp_pat
         while True:
             value=service.poll(now)
             if value['usage_collection_complete'] and not value['index']['loading']:break
-            if time.monotonic()>=deadline:
-                index=service.index
-                pytest.fail('closed collection deadline '+json.dumps(dict(now=now,index=value['index'],
-                    errors=value['usage_errors'],header_pending=sorted(index.header_pending),
-                    partial_headers={path:dict(pending=state.get('header_pending'),signature=state.get('signature'))
-                        for path,state in index.partial_work.items()},
-                    queued=[str(row[0]) for row in index.queue],rebuilding=list(index.rebuild_jobs),
-                    pending_rebuilds=list(index.pending_rebuilds)),ensure_ascii=False))
+            assert time.monotonic()<deadline,dict(index=value['index'],errors=value['usage_errors'],
+                header_pending=sorted(service.index.header_pending))
         reader=CollectionChannel([home],target,evidence)
         try:value=reader.read(shared=True)
         finally:reader.close()
