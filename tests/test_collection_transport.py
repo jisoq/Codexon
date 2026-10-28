@@ -230,37 +230,20 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
         service.poll(detailed=False)
         process.start();child.close()
         parent.send(dict(kind='selected',owners=[(None,TID)]))
-        deadline=time.monotonic()+15;last_message=None;current=None;received={}
+        deadline=time.monotonic()+15;current=None
         while True:
             remaining=deadline-time.monotonic()
-            if remaining<=0:
-                live=writer.live.current
-                pytest.fail('analyzer publication deadline '+json.dumps(dict(
-                    alive=process.is_alive(),exitcode=process.exitcode,last_message=last_message,received=received,
-                    snapshot=None if current is None else dict(ts=current['ts'],
-                        ledger_status_known=current.get('ledger_status_known'),
-                        ledger_fault=current.get('ledger_fault'),ledger_error=current.get('ledger_error'),
-                        usage_complete=current['usage_collection_complete'],index=current['index'],
-                        selected_resolutions=current.get('selected_resolutions'),
-                        sessions=[row['id'] for row in current['sessions']],
-                        overlays=[(row['id'],row['calls']) for row in current['overlay_sessions']]),
-                    requested=writer.live.requested_selections(time.time()),
-                    captured={request:dict(complete=value['membership_complete'],
-                        membership=value['membership'],owners=[(row['home'],row['sid'],row['state'])
-                            for row in value['owners']]) for request,value in live['selections'].items()},
-                    revision=writer.live.demand_revision,published_revision=live['selection_revision'],
-                    index=service.last['index'],source_errors=service.last['usage_errors']),ensure_ascii=False))
+            assert remaining>0,dict(usage_complete=None if current is None else current['usage_collection_complete'],
+                overlays=[] if current is None else [(row['id'],row['calls']) for row in current['overlay_sessions']])
             service.poll(detailed=False)
             if not parent.poll(min(.05,remaining)):continue
             first=parent.recv()
-            received[first['kind']]=received.get(first['kind'],0)+1
-            last_message={key:value for key,value in first.items() if key!='value'}
             if first['kind']=='progress':
                 assert first.get('scope')=='startup',first
                 continue
             assert first['kind']=='snapshot',first
             current=receiver.receive(first['value'])
-            if current is not None and current.get('ledger_status_known') and any(
+            if current is not None and current['usage_collection_complete'] and any(
                     row['id']==TID and row['calls']==1 for row in current['overlay_sessions']):break
         wait_until(lambda:bool(writer.live.waiters))
         changed_at=current['ts']+.25
