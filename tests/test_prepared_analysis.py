@@ -2130,3 +2130,59 @@ def test_inventory_projects_model_choices_and_charges_the_complete_packet(tmp_pa
             with storage.PreparedReader(path,limits) as reader,reader.pin(token) as view:
                 with pytest.raises(storage.CapacityExceeded,match='delivered-page'):
                     view.inventory(owners=(owners[-1],))
+
+
+def test_prepared_history_grows_past_legacy_database_admission(tmp_path):
+    from types import SimpleNamespace
+    from cachemonitor.prepared_ingest import pages
+
+    path = tmp_path/'growing-history.sqlite'
+    original = calls()
+    with storage.PreparedStore(path) as store:
+        previous = publish(store, 1, original)
+    with sqlite3.connect(path) as db:
+        page_count = db.execute('PRAGMA page_count').fetchone()[0]
+        page_size = db.execute('PRAGMA page_size').fetchone()[0]
+        assert db.execute('PRAGMA quick_check(1)').fetchone()[0] == 'ok'
+    legacy = SimpleNamespace(**(vars(storage.Limits()) | {
+        'database_bytes': (page_count-1)*page_size,
+    }))
+    replacement = [dict(key=f'call-{number:04d}-'+('x'*256), ts=100+number,
+                        session_ordinal=number, turn='request', input=100,
+                        cached=20, output=10, cost=1.)
+                   for number in range(200)]
+    with storage.PreparedStore(path, limits=legacy) as store:
+        assert store.token == previous
+        with store.read_current() as view:
+            assert [row['key'] for row in pages(view.calls, OWNER)] == [row['key'] for row in original]
+        current = publish(store, 2, replacement)
+        with store.read_current() as view:
+            assert view.token == current
+            assert [row['key'] for row in pages(view.calls, OWNER)] == [row['key'] for row in replacement]
+        assert store.db.execute('PRAGMA page_count').fetchone()[0] > page_count
+    with storage.PreparedStore(path) as store:
+        assert store.token == current
+        with store.read_current() as view:
+            assert len(list(pages(view.calls, OWNER))) == len(replacement)
+
+
+def test_catalog_order_streams_complete_membership_past_page_scratch(tmp_path):
+    from cachemonitor.prepared_ingest import pages
+
+    owners = [('home', f'owner-{number:03d}-'+('x'*128)) for number in range(40)]
+    dependency = dict.fromkeys(storage.DEPENDENCIES, 1)
+    dependency['source_digest'] = '1'*64
+    with storage.PreparedStore(tmp_path/'streamed-order.sqlite') as store:
+        stage = store.begin(('source', 1))
+        for ordinal, owner in enumerate(owners):
+            stage.owner(*owner, dict(home=owner[0], id=owner[1]), dependency,
+                        source_ordinal=ordinal)
+        stage.publish(('source', 1), ready=True)
+        stage = store.begin(('source', 2))
+        stage.limits = replace(stage.limits, page_objects_bytes=1024, write_rows=2)
+        expected = list(reversed(owners))
+        stage.catalog_order((owner, ordinal) for ordinal, owner in enumerate(expected))
+        stage.publish(('source', 2), ready=True)
+        with store.read_current() as view:
+            assert [row['owner'] for row in pages(view.ordering)] == expected
+            assert [view.owner(*owner)['owner_ordinal'] for owner in expected] == list(range(len(owners)))
