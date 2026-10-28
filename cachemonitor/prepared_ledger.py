@@ -93,7 +93,6 @@ class PreparedLedger:
         if db.in_transaction:
             raise RuntimeError('prepare the source plan before starting quota application')
         self._clear_plan()
-        waiting = 0
         ordinal = 0
         token = None
 
@@ -114,7 +113,7 @@ class PreparedLedger:
         db.commit()
 
         def stage_source(key, source, certificate):
-            nonlocal waiting, ordinal
+            nonlocal ordinal
             self._check_plan(token)
             policy, active = home_policy(key[0])
             pending = bool(source.get('_collection_pending'))
@@ -131,7 +130,6 @@ class PreparedLedger:
             db.execute('INSERT INTO temp.prepared_ledger_sources VALUES(?,?,?,?,?,?,?,?,?,?)',
                        (ordinal, *key, packet, weight, certificate, request_digest, int(pending), int(calls), int(tasks)))
             self.ledger.stage_prepared_coverage(source)
-            waiting += int(calls or tasks)
             ordinal += 1
             if ordinal % OWNER_BATCH == 0:
                 db.commit()
@@ -182,7 +180,7 @@ class PreparedLedger:
                     db.execute('DELETE FROM temp.prepared_ledger_requests WHERE home=? AND sid=?', tuple(row))
             db.commit()
             after = tuple(rows[-1])
-        return token, waiting
+        return token
 
     def _confirm_activity(self):
         db = self.ledger.db
@@ -456,9 +454,9 @@ class PreparedLedger:
         return dict(history=rows,turn_records=boundaries),size,dict(transition,policy=policy)
 
     def sync(self, envelope, *, removed=()):
-        """Apply bounded owner cohorts, then finalize complete catalog coverage."""
+        """Yield durable batches with a boolean signal for remaining work."""
         db = self.ledger.db
-        token, remaining = self._stage_plan(envelope, removed)
+        token = self._stage_plan(envelope, removed)
         while True:
             self._check_plan(token)
             rows = db.execute('SELECT home,sid FROM temp.prepared_ledger_retired '
@@ -475,7 +473,7 @@ class PreparedLedger:
                                (tuple(row) for row in rows))
                 self._check_plan(token)
             if retired:
-                yield dict(owners=(), remaining=remaining, retired=retired)
+                yield dict(owners=(), remaining=True, retired=retired)
 
         after = -1
         allow_append = True
@@ -559,20 +557,20 @@ class PreparedLedger:
                 db.commit()
             activity_done = True
             after = end
-            remaining -= len(requests)
             self.metrics['applied_owners'] += len(states)
             self.metrics['append_owners'] = self.metrics.get('append_owners', 0)+len(append_sources)
             yield dict(owners=tuple(states), task_owners=tuple(
                 (row['home'], row['sid']) for row in headers
-                if row['ordinal']<=end and row['task_waiting']), remaining=remaining, retired=())
+                if row['ordinal']<=end and row['task_waiting']), remaining=True, retired=())
             del states, requests, sessions, append_sources, selected, snapshot
         if not activity_done:
             self._check_plan(token)
             self.ledger.sync(SimpleNamespace(sessions={}, internal_sessions={}),
                              dict(envelope, sessions=[], collection_partial=True), applied_sources={}, prepared_plan=True)
             self._confirm_activity()
-            yield dict(owners=(), remaining=0, retired=())
+            yield dict(owners=(), remaining=True, retired=())
         for _ in self.ledger.reconcile_prepared_coverage(envelope, check=lambda: self._check_plan(token),
                                                        metadata_bytes=METADATA_BYTES):
-            yield dict(owners=(), remaining=0, retired=())
+            yield dict(owners=(), remaining=True, retired=())
         self._clear_plan()
+        yield dict(owners=(), remaining=False, retired=())
