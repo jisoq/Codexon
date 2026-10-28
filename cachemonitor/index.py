@@ -1159,6 +1159,7 @@ class UsageIndex:
             self.errors.append(self.model_evidence.error)
         ready=self.ready_sessions(usage_complete)
         views = []
+        evidence_sources={tuple(owner) for owner in self.demand['evidence']} if self.demand is not None else set()
         # Resolve each home once per publication, not once per retained session.
         # The next publication resolves again so changed links are still observed.
         evidence_homes = {home:home_key(home) for home in dict.fromkeys(home for home,_ in self.monitor.sessions)}
@@ -1172,7 +1173,8 @@ class UsageIndex:
             s.trim(now)
             if s.excluded_title:
                 continue
-            if not s.requests and not s.reported_usage and not s.transports and not s.request_state and key not in self.selected_members:
+            if (not s.requests and not s.reported_usage and not s.transports and not s.request_state
+                    and key not in self.selected_members and key not in evidence_sources):
                 continue
             view = dict(s.view(now,use_cache=True))
             view['history'] = self.model_evidence.enrich_owned(evidence_homes[s.home],view['history'],s,

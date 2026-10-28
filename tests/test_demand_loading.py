@@ -561,7 +561,7 @@ def test_selected_writer_completes_with_empty_mode_ancestor_outside_family(tmp_p
         assert parent['collection_complete']
         detail,_=selected_detail(service,writer,receiver,current,CHILD,'empty-mode-ancestor')
         assert detail['summary']['calls']==1
-        assert detail['summary']['latest']['service_tier']=='미확인'
+        assert detail['summary']['latest']['mode']=='미확인'
 
 
 def test_writer_keeps_selected_detail_live_until_explicit_aggregate_completes_and_preserves_ledger(tmp_path,monkeypatch):

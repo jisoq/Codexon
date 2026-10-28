@@ -215,21 +215,28 @@ def test_benchmark_watcher_keeps_activity_until_owner_replay_finishes(tmp_path,m
 
 def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_path):
     import multiprocessing as mp
+    from cachemonitor.analysis_delivery import SnapshotReceiver
     from cachemonitor.analysis_worker import process_main
     from cachemonitor.usage_collection import CollectorService
-    from test_core import fixture_home
+    from test_core import TID, fixture_home
+    from test_demand_loading import write_session
     home,_=fixture_home(tmp_path)
+    write_session(home,TID)
     service=CollectorService([home],tmp_path/'index.sqlite');writer=service.channel
-    context=mp.get_context('spawn');parent,child=context.Pipe()
+    context=mp.get_context('spawn');parent,child=context.Pipe();receiver=SnapshotReceiver()
     process=context.Process(target=process_main,args=(child,writer.homes,writer.path),
         kwargs={'quota_path':tmp_path/'quota.sqlite'})
     try:
         service.poll(detailed=False)
         process.start();child.close()
+        parent.send(dict(kind='selected',owners=[(None,TID)]))
         deadline=time.monotonic()+15
         while True:
             remaining=deadline-time.monotonic()
-            assert remaining>0
+            assert remaining>0,dict(alive=process.is_alive(),exitcode=process.exitcode,
+                requested=writer.live.requested_selections(time.time()),
+                captured=tuple(writer.live.current['selections']),revision=writer.live.demand_revision,
+                published_revision=writer.live.current['selection_revision'])
             service.poll(detailed=False)
             if not parent.poll(min(.05,remaining)):continue
             first=parent.recv()
@@ -237,15 +244,21 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
                 assert first.get('scope')=='startup',first
                 continue
             assert first['kind']=='snapshot',first
-            if first['value'].get('ledger_status_known'):break
+            current=receiver.receive(first['value'])
+            if current is not None and current.get('ledger_status_known') and any(
+                    row['id']==TID and row['calls']==1 for row in current['overlay_sessions']):break
         wait_until(lambda:bool(writer.live.waiters))
-        changed_at=first['value']['ts']+.25
+        changed_at=current['ts']+.25
         started=time.perf_counter();service.poll(now=changed_at,detailed=False)
         while True:
             remaining=1-(time.perf_counter()-started)
             assert remaining>0 and parent.poll(remaining)
             second=parent.recv();assert second['kind']=='snapshot'
-            if second['value']['ts']==changed_at:break
+            current=receiver.receive(second['value'])
+            if current is not None and current['ts']==changed_at:break
+        assert {row['id'] for row in current['sessions']}=={TID}
+        assert {row['id'] for row in current['overlay_sessions']}=={TID}
+        assert current['overlay_sessions'][0]['calls']==1
         assert not second['value']['sessions'] and not second['value']['overlay_sessions']
         assert not second['value']['model_candidates'] and not second['value']['cache_candidates']
         assert time.perf_counter()-started<1
