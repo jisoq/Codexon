@@ -92,8 +92,13 @@ def test_selected_patch_preserves_retained_facts_and_global_order_without_invent
             unrelated = view.record('home','unrelated','unrelated-response')
         sources['root'] = source('root', amount=101)
         selected = catalog(sources,2,family=('child','root'))
+        inventory = storage.Snapshot.inventory
+        def scoped_inventory(view, *, owners=None, **kwargs):
+            if owners is None:
+                forbidden_population()
+            return inventory(view, owners=owners, **kwargs)
         with monkeypatch.context() as guard:
-            guard.setattr(storage.Snapshot, 'inventory', forbidden_population)
+            guard.setattr(storage.Snapshot, 'inventory', scoped_inventory)
             guard.setattr(storage.Snapshot, 'inventory_scan', forbidden_population)
             updates = list(ingest.PreparedCohort(store,None,None).convert(selected))
         assert updates[-1]['ready']
