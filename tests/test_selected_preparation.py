@@ -180,18 +180,20 @@ def test_new_selected_ranks_remain_stable_and_pinned_order_survives_switches(
             assert [view.owner('home',sid)['owner_ordinal'] for sid in sources] == [0,1,2,3]
             assert all(view.record('home',sid,sid+'-response') for sid in sources)
 
-def test_format7_cache_rebuilds_before_selected_authority_is_read(tmp_path, source_reader):
+@pytest.mark.parametrize('old_format',[7,8])
+def test_old_cache_rebuilds_before_selected_authority_is_read(tmp_path, source_reader,old_format):
     sources = source_reader
     sources['a'] = source('a')
     path = tmp_path/'format7.sqlite'
     with storage.PreparedStore(path) as store:
         list(ingest.PreparedCohort(store,None,None).convert(catalog(sources)))
         old = store.token
-        store.db.execute('ALTER TABLE meta DROP COLUMN selection_batch')
-        store.db.execute('UPDATE meta SET format=7 WHERE singleton=1')
+        if old_format==7:store.db.execute('ALTER TABLE meta DROP COLUMN selection_batch')
+        store.db.execute('DROP TABLE IF EXISTS ledger_pending')
+        store.db.execute('UPDATE meta SET format=? WHERE singleton=1',(old_format,))
     with storage.PreparedStore(path) as store:
         assert store.token.instance != old.instance and store.token.generation == 0
-        assert store.db.execute('SELECT format,selection_batch FROM meta').fetchone()[:] == (8,0)
+        assert store.db.execute('SELECT format,selection_batch FROM meta').fetchone()[:] == (storage.FORMAT,0)
         list(ingest.PreparedCohort(store,None,None).convert(catalog(sources,2,family=('a',))))
         assert store.db.execute('SELECT selection_batch FROM meta').fetchone()[0] > 0
 
@@ -310,7 +312,8 @@ def test_cancelled_selected_cohort_can_switch_through_aggregate(tmp_path,source_
 
 
 
-def test_selected_outside_ledger_correction_survives_restart_without_inventory(tmp_path,monkeypatch,source_reader):
+@pytest.mark.parametrize('stop_after',['prepared','ledger'])
+def test_selected_outside_ledger_correction_survives_restart_without_inventory(tmp_path,monkeypatch,source_reader,stop_after):
     from contextlib import closing
     from cachemonitor.prepared_ledger import PreparedLedger
     from cachemonitor.quota_cycles import QuotaLedger
@@ -332,6 +335,16 @@ def test_selected_outside_ledger_correction_survives_restart_without_inventory(t
             expected={owner:progress.source_stamp(view.owner(*owner)['dependencies'])
                       for owner in (('home','a'),('home','z'))}
             assert view.record('home','z','shared') is not None
+        if stop_after=='ledger':
+            with monkeypatch.context() as stopped:
+                def before_ack(*args,**kwargs):
+                    raise InterruptedError('stop after quota commit before acknowledgment')
+                stopped.setattr(storage.PreparedStore,'acknowledge_ledger',before_ack,raising=False)
+                with pytest.raises(InterruptedError,match='before acknowledgment'):
+                    list(PreparedLedger(ledger,store).sync(dict(_envelope(201),collection_partial=True),
+                                                         owners=(('home','a'),)))
+            assert progress.applied(ledger.db,expected)==expected
+            assert store.db.execute('SELECT count(*) FROM ledger_pending').fetchone()[0]>0
 
     with storage.PreparedStore(prepared_path) as store,closing(QuotaLedger(quota_path)) as ledger:
         revisions=storage.Snapshot.owner_revisions
@@ -347,9 +360,57 @@ def test_selected_outside_ledger_correction_survives_restart_without_inventory(t
         monkeypatch.setattr(storage.Snapshot,'inventory_scan',forbidden_population)
         updates=list(ingest.PreparedCohort(store,None,None).convert(selected))
         assert all(not update['changed'] for update in updates)
-        list(PreparedLedger(ledger,store).sync(dict(_envelope(201),collection_partial=True),owners=(('home','a'),)))
+        adapter=PreparedLedger(ledger,store)
+        list(adapter.sync(dict(_envelope(201),collection_partial=True),owners=(('home','a'),)))
         assert [tuple(row) for row in ledger.db.execute('SELECT uid,sid FROM calls ORDER BY uid')]==[('new','a'),('shared','z')]
         assert progress.applied(ledger.db,expected)==expected
+        assert store.db.execute('SELECT count(*) FROM ledger_pending').fetchone()[0]==0
+        if stop_after=='ledger':assert adapter.metrics['call_rows']==0
+
+
+def test_committed_retirement_survives_restart_and_selected_sync(tmp_path,monkeypatch,source_reader):
+    from contextlib import closing
+    from cachemonitor.prepared_ledger import PreparedLedger
+    from cachemonitor.quota_cycles import QuotaLedger
+    from cachemonitor import quota_prepared_sync as progress
+    from test_prepared_ledger_reuse import _envelope
+
+    sources=source_reader
+    sources.update(a=source('a'),z=source('z'))
+    prepared_path=tmp_path/'retired.sqlite';quota_path=tmp_path/'retired-quota.sqlite'
+    with storage.PreparedStore(prepared_path) as store,closing(QuotaLedger(quota_path)) as ledger:
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources)))
+        list(PreparedLedger(ledger,store).sync(_envelope()))
+        assert ('home','z') in progress.applied(ledger.db,[('home','z')])
+        del sources['z']
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources,2)))
+        while store.maintain(rows=8):pass
+
+    with storage.PreparedStore(prepared_path) as store,closing(QuotaLedger(quota_path)) as ledger:
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources,3,family=('a',))))
+        revisions=storage.Snapshot.owner_revisions
+        def bounded_revisions(view,owners=None,**kwargs):
+            assert owners is not None and set(owners)<={('home','a')}
+            return revisions(view,owners,**kwargs)
+        monkeypatch.setattr(storage.Snapshot,'owner_revisions',bounded_revisions)
+        list(PreparedLedger(ledger,store).sync(dict(_envelope(201),collection_partial=True),owners=(('home','a'),)))
+        assert progress.applied(ledger.db,[('home','z')])=={}
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,input FROM calls ORDER BY sid')]==[('a',100),('z',100)]
+        assert store.db.execute('SELECT count(*) FROM ledger_pending').fetchone()[0]==0
+
+
+def test_ledger_acknowledgment_cannot_clear_a_newer_prepared_generation(tmp_path,source_reader):
+    sources=source_reader
+    sources['a']=source('a')
+    with storage.PreparedStore(tmp_path/'ack.sqlite') as store:
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources,1,family=('a',))))
+        captured=store.token
+        sources['a']=source('a',amount=101)
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources,2,family=('a',))))
+        with pytest.raises(storage.StaleGeneration):
+            store.acknowledge_ledger((('home','a'),),expected=captured)
+        assert [tuple(row) for row in store.db.execute(
+            'SELECT o.home,o.sid FROM ledger_pending p JOIN owners o ON o.id=p.owner')]==[('home','a')]
 
 
 @pytest.mark.parametrize('previous_family',[None,('a','unrelated')])
@@ -418,7 +479,7 @@ def test_writer_selected_scope_survives_aggregate_lease_and_source_revision(tmp_
                     and call_counts()=={TID:1,CHILD:1,OTHER:1})
         with closing(storage.PreparedReader(writer.path)) as reader,reader._pin(allow_incomplete=True) as view:
             global_batch=view.order_batch
-            global_order=list(view.db.execute('SELECT owner,ordinal FROM catalog_orders WHERE batch=? ORDER BY ordinal',
+            global_order=list(view.db.execute('SELECT owner,source_ordinal FROM catalog_orders WHERE batch=? ORDER BY source_ordinal',
                                                (global_batch,)))
             unrelated=view.owner(str(home),OTHER)['dependencies']
 
@@ -472,7 +533,7 @@ def test_writer_selected_scope_survives_aggregate_lease_and_source_revision(tmp_
 
         with closing(storage.PreparedReader(writer.path)) as reader,reader._pin(allow_incomplete=True) as view:
             assert view.order_batch==global_batch
-            assert list(view.db.execute('SELECT owner,ordinal FROM catalog_orders WHERE batch=? ORDER BY ordinal',
+            assert list(view.db.execute('SELECT owner,source_ordinal FROM catalog_orders WHERE batch=? ORDER BY source_ordinal',
                                         (global_batch,)))==global_order
             assert view.owner(str(home),OTHER)['dependencies']==unrelated
         assert call_counts()=={TID:2,CHILD:1,OTHER:1}
