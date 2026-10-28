@@ -392,7 +392,7 @@ class LiveCollection:
                     demand = dict(selected=[list(owner) for owner in dict.fromkeys(map(tuple, demand['selected']))],
                                   aggregate=demand['aggregate'],
                                   evidence=[list(owner) for owner in dict.fromkeys(map(tuple, demand['evidence']))])
-                    if value.get('protocol') in (3,4,5):demand['aggregate']=True
+                    if value.get('protocol') in (3,4,5) and not value.get('header_only'):demand['aggregate']=True
                     self.leases[client]=(list(homes),time.time(),demand)
                     value = dict(value, demand=demand)
                     if demand!=previous or homes!=prior_homes:self.demand_revision+=1
