@@ -310,7 +310,8 @@ def test_cancelled_selected_cohort_can_switch_through_aggregate(tmp_path,source_
 
 
 
-def test_warning_selection_switch_does_not_compare_the_retained_global_population(tmp_path,source_reader):
+@pytest.mark.parametrize('previous_family',[None,('a','unrelated')])
+def test_warning_selection_switch_does_not_compare_the_retained_global_population(tmp_path,source_reader,previous_family):
     from threading import Condition,Event
     from types import SimpleNamespace
     from cachemonitor.prepared_speed_writer import PreparedWarningWorker,_WarningTarget
@@ -328,7 +329,7 @@ def test_warning_selection_switch_does_not_compare_the_retained_global_populatio
         with store.read_current() as view:
             stamps={owner:ingest.PreparedCohort._speed_stamp(view.owner(*owner))
                     for owner in (('home','a'),('home','unrelated'))}
-        previous=_WarningTarget(store.token,storage.pack(ingest.source_identity(catalog(sources))),
+        previous=_WarningTarget(store.token,storage.pack(ingest.source_identity(catalog(sources,family=previous_family))),
                                 GlobalPopulation(stamps),{})
         worker=SimpleNamespace(_target=previous,_active=None,_anchor=previous,_pending=None,_completed=None,
                                _known=None,_failure=None,condition=Condition(),interrupt=Event())
@@ -339,6 +340,9 @@ def test_warning_selection_switch_does_not_compare_the_retained_global_populatio
         assert worker.interrupt.is_set()
         assert set(worker._target.owners)=={('home','a')}
         assert worker._target.prefixes=={}
+        next_revision=_WarningTarget(selected_token,storage.pack(ingest.source_identity(
+            catalog(sources,3,family=('a',)))),worker._target.owners,{})
+        assert worker._target.scope==next_revision.scope
 
 
 def test_writer_selected_scope_survives_aggregate_lease_and_source_revision(tmp_path,monkeypatch):

@@ -358,7 +358,7 @@ class _WarningTarget:
     @property
     def scope(self):
         value=unpack(self.source)
-        return self.token.instance,*value[:3]
+        return self.token.instance,*value[:3],*value[4:]
 
 
 @dataclass(frozen=True,slots=True)
@@ -429,10 +429,12 @@ class PreparedWarningWorker:
         current=_WarningTarget(token,source,dict(owners),{})
         with self.condition:
             anchor=self._active or self._anchor
-            bridge=dict(self._pending.prefixes) if self._pending is not None else {}
+            bridge={}
             if anchor is not None and anchor.scope!=current.scope:
-                self.interrupt.set();bridge.clear();self._completed=None
+                self.interrupt.set();self._completed=None
                 anchor=None
+            elif self._pending is not None:
+                bridge=dict(self._pending.prefixes)
             if anchor is not None and previous is not None:
                 for owner in previous.owners.keys()|current.owners.keys():
                     old=previous.owners.get(owner);new=current.owners.get(owner)
