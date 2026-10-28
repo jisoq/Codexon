@@ -550,3 +550,55 @@ def test_older_recovery_heartbeat_cannot_reconcile_newer_coverage(tmp_path):
         assert [tuple(row) for row in ledger.db.execute('SELECT * FROM coverage_issues')] == before
         assert tuple(ledger.db.execute(
             "SELECT at,complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (200, 200, 0, 1)
+
+
+
+def test_fresh_recovery_continues_owner_cohorts_after_its_own_tracking_activity(tmp_path, monkeypatch):
+    monkeypatch.setattr(delivery, 'OWNER_BATCH', 4)
+    names = [f'owner-{number:03d}' for number in range(12)]
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        ledger.db.execute("INSERT INTO tracking_config VALUES('home',50)")
+        ledger.db.execute("INSERT INTO tracking_controls VALUES('home',50,1)")
+        ledger.db.commit()
+        _publish(store, 1, {sid: 1 for sid in names})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        _publish(store, 2, {sid: 2 for sid in names})
+        updates = list(adapter.sync(dict(_envelope(201), collection_recovery=True)))
+        assert {owner for update in updates for owner in update['owners']} == {('home', sid) for sid in names}
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,cost FROM calls ORDER BY sid')] == [(sid, .2) for sid in names]
+        assert ledger.db.execute('SELECT count(*) FROM tracking_tasks').fetchone()[0] == len(names)
+        assert tuple(ledger.db.execute("SELECT at,complete_at,loading FROM state WHERE home='home'").fetchone()) == (201, 201, 0)
+        assert tuple(ledger.db.execute("SELECT at,complete FROM tracking_health WHERE home='home'").fetchone()) == (201, 1)
+        with store.read_current() as view:
+            expected = {('home', sid): progress.source_stamp(view.owner('home', sid)['dependencies']) for sid in names}
+        assert progress.applied(ledger.db, expected) == expected
+
+
+def test_recovery_cohort_cannot_overwrite_newer_state_committed_during_plan(tmp_path, monkeypatch):
+    import sqlite3
+
+    monkeypatch.setattr(delivery, 'OWNER_BATCH', 4)
+    names = [f'owner-{number:03d}' for number in range(12)]
+    path = tmp_path/'quota.sqlite'
+    with closing(QuotaLedger(path)) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        ledger.db.execute("INSERT INTO tracking_config VALUES('home',50)")
+        ledger.db.execute("INSERT INTO tracking_controls VALUES('home',50,1)")
+        ledger.db.commit()
+        _publish(store, 1, {sid: 1 for sid in names})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        _publish(store, 2, {sid: 2 for sid in names})
+        updates = adapter.sync(dict(_envelope(201), collection_recovery=True))
+        first = next(updates)
+        applied = {owner[1] for owner in first['owners']}
+        assert len(applied) == 4
+        with sqlite3.connect(path) as writer:
+            writer.execute("UPDATE state SET at=202,complete_at=202,loading=0,unclassified=99 WHERE home='home'")
+        with pytest.raises(ValueError, match='unconfirmed|newer|recovery'):
+            list(updates)
+        ledger.db.rollback()
+        assert tuple(ledger.db.execute(
+            "SELECT at,complete_at,loading,unclassified FROM state WHERE home='home'").fetchone()) == (202, 202, 0, 99)
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,cost FROM calls ORDER BY sid')] == [
+            (sid, .2 if sid in applied else .1) for sid in names]
