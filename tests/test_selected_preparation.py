@@ -307,3 +307,154 @@ def test_cancelled_selected_cohort_can_switch_through_aggregate(tmp_path,source_
             assert view.record('home','b','b-response')['input']==102
         with storage.PreparedReader(store.path) as reader,reader.pin(store.token) as view:
             assert [row['owner'] for row in ingest.pages(view.catalog)]==[('home','a')]
+
+
+
+def test_writer_selected_scope_survives_aggregate_lease_and_source_revision(tmp_path,monkeypatch):
+    from contextlib import closing
+    import sqlite3
+    import time
+    from cachemonitor.analysis_delivery import SnapshotReceiver
+    from cachemonitor.prepared_runtime import PreparedWriter
+    from cachemonitor.usage_collection import CollectorService,CollectionClient
+    from test_demand_loading import fixture_home,write_session,publication,TID,CHILD,OTHER
+
+    home,_=fixture_home(tmp_path)
+    at=time.time()-100
+    write_session(home,TID,at=at)
+    write_session(home,CHILD,parent=TID,at=at+1)
+    write_session(home,OTHER,at=at+2)
+    target=tmp_path/'source.sqlite';quota=tmp_path/'quota.sqlite'
+    receiver=SnapshotReceiver()
+    family={(str(home),TID),(str(home),CHILD)}
+
+    def call_counts():
+        with sqlite3.connect(quota) as db:
+            return dict(db.execute('SELECT sid,count(*) FROM calls GROUP BY sid'))
+
+    with closing(CollectorService([home],target)) as service,closing(CollectionClient([home],target)) as aggregate,\
+            closing(PreparedWriter([home],target,None,quota)) as writer:
+        aggregate.set_demand((),aggregate=True)
+        writer.set_selected([(None,TID)])
+        writer.set_aggregate('seed')
+        publication(service,writer,receiver,lambda value:value.get('aggregate_request')=='seed'
+                    and call_counts()=={TID:1,CHILD:1,OTHER:1})
+        with closing(storage.PreparedReader(writer.path)) as reader,reader._pin(allow_incomplete=True) as view:
+            global_batch=view.order_batch
+            global_order=list(view.db.execute('SELECT owner,ordinal FROM catalog_orders WHERE batch=? ORDER BY ordinal',
+                                               (global_batch,)))
+            unrelated=view.owner(str(home),OTHER)['dependencies']
+
+        original_catalog=storage.Snapshot.catalog
+        original_inventory=storage.Snapshot.inventory
+        original_revisions=storage.Snapshot.owner_revisions
+        original_poll=CollectionClient.poll_catalog
+        original_selection=CollectionClient.poll_selection
+        selected_started=False
+        with monkeypatch.context() as scoped:
+            def poll_catalog(client,*args,**kwargs):
+                assert client.active_demand['aggregate'],'selected request used full catalog'
+                return original_poll(client,*args,**kwargs)
+            def poll_selection(client,*args,**kwargs):
+                nonlocal selected_started
+                result=original_selection(client,*args,**kwargs)
+                selected_started=True
+                return result
+            def selected_catalog(view,*args,**kwargs):
+                page=original_catalog(view,*args,**kwargs)
+                if selected_started:
+                    assert all(row['owner'] in family for row in page.rows),'unrelated prepared metadata'
+                return page
+            def selected_inventory(view,owners=None,*args,**kwargs):
+                if selected_started:
+                    assert owners is not None or view.selected,'global prepared inventory'
+                    if owners is not None:assert set(owners)<=family
+                return original_inventory(view,*args,owners=owners,**kwargs)
+            def selected_revisions(view,owners=None,*args,**kwargs):
+                if selected_started:
+                    assert owners is not None and set(owners)<=family,'global ledger inventory'
+                return original_revisions(view,owners,*args,**kwargs)
+            scoped.setattr(CollectionClient,'poll_catalog',poll_catalog)
+            scoped.setattr(CollectionClient,'poll_selection',poll_selection)
+            scoped.setattr(storage.Snapshot,'catalog',selected_catalog)
+            scoped.setattr(storage.Snapshot,'inventory',selected_inventory)
+            original_scan=storage.Snapshot.inventory_scan
+            def inventory_scan(view,*args,**kwargs):
+                assert not selected_started,'global prepared inventory scan'
+                return original_scan(view,*args,**kwargs)
+            scoped.setattr(storage.Snapshot,'inventory_scan',inventory_scan)
+            scoped.setattr(storage.Snapshot,'owner_revisions',selected_revisions)
+            writer.set_aggregate(None)
+            selected=publication(service,writer,receiver,lambda value:value.get('aggregate_request') is None
+                                 and {row['id'] for row in value['sessions']}=={TID,CHILD})
+            first_revision=selected['prepared_token']
+            write_session(home,TID,count=2,at=at+5)
+            updated=publication(service,writer,receiver,lambda value:value.get('aggregate_request') is None
+                                and value['prepared_token']!=first_revision and call_counts()=={TID:2,CHILD:1,OTHER:1})
+            assert {row['id'] for row in updated['sessions']}=={TID,CHILD}
+
+        with closing(storage.PreparedReader(writer.path)) as reader,reader._pin(allow_incomplete=True) as view:
+            assert view.order_batch==global_batch
+            assert list(view.db.execute('SELECT owner,ordinal FROM catalog_orders WHERE batch=? ORDER BY ordinal',
+                                        (global_batch,)))==global_order
+            assert view.owner(str(home),OTHER)['dependencies']==unrelated
+        assert call_counts()=={TID:2,CHILD:1,OTHER:1}
+
+
+def test_writer_selected_mode_context_and_canonical_competitor_remain_outside_display(tmp_path,monkeypatch):
+    from contextlib import closing
+    import json
+    import sqlite3
+    import time
+    from cachemonitor.analysis_delivery import SnapshotReceiver
+    from cachemonitor.prepared_runtime import PreparedWriter
+    from cachemonitor.usage_collection import CollectorService,CollectionClient
+    from test_demand_loading import fixture_home,write_session,publication,TID,CHILD,OTHER,NEW
+
+    home,_=fixture_home(tmp_path)
+    at=time.time()-100
+    write_session(home,NEW,mode='priority',at=at-10)
+    selected=write_session(home,TID,parent=NEW,mode=None,at=at)
+    write_session(home,CHILD,parent=TID,at=at+1)
+    competitor=write_session(home,OTHER,at=at)
+
+    def response(path,value):
+        rows=[json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+        for row in rows:
+            if row.get('type')=='token_usage_record':row['payload']['response_id']=value
+        path.write_text(''.join(json.dumps(row)+'\n' for row in rows),encoding='utf-8')
+
+    response(selected,'shared');response(competitor,'shared')
+    target=tmp_path/'source.sqlite';quota=tmp_path/'quota.sqlite'
+    receiver=SnapshotReceiver();requested=[]
+    original_request=CollectionClient.request_sources
+    def request_sources(client,owners):
+        owners=tuple(owners);requested.extend(owners)
+        return original_request(client,owners)
+    monkeypatch.setattr(CollectionClient,'request_sources',request_sources)
+
+    def ledger_owner(response_id):
+        with sqlite3.connect(quota) as db:
+            return [row[0] for row in db.execute('SELECT sid FROM calls WHERE uid=?',(response_id,))]
+
+    with closing(CollectorService([home],target)) as service,\
+            closing(PreparedWriter([home],target,None,quota)) as writer:
+        writer.set_selected([(None,TID)])
+        writer.set_aggregate('seed')
+        publication(service,writer,receiver,lambda value:value.get('aggregate_request')=='seed'
+                    and ledger_owner('shared')==[TID])
+        requested.clear()
+        writer.set_aggregate(None)
+        publication(service,writer,receiver,lambda value:value.get('aggregate_request') is None
+                    and {row['id'] for row in value['sessions']}=={TID,CHILD})
+        response(selected,'replacement')
+        changed=publication(service,writer,receiver,lambda value:value.get('aggregate_request') is None
+                            and ledger_owner('shared')==[OTHER] and ledger_owner('replacement')==[TID])
+        assert {row['id'] for row in changed['sessions']}=={TID,CHILD}
+        assert (str(home),OTHER) in requested
+        with closing(storage.PreparedReader(writer.path)) as reader,reader._pin(allow_incomplete=True) as view:
+            assert view.record(str(home),TID,'replacement')['service_tier']=='Fast'
+            assert view.record(str(home),TID,'shared') is None
+            assert view.record(str(home),OTHER,'shared')['input']==10000
+        with closing(storage.PreparedReader(writer.path)) as reader,reader.pin() as view:
+            assert {row['owner'] for row in view.pages(view.catalog)}=={(str(home),TID),(str(home),CHILD)}
