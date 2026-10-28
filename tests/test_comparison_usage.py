@@ -577,7 +577,7 @@ def test_compaction_without_replacement_headroom_keeps_exact_logical_populations
 
 def test_optional_fold_is_dropped_when_reader_limit_shrinks_and_can_be_rebuilt():
     from cachemonitor.comparison_usage import LIMIT
-    from cachemonitor.prepared_store import CapacityExceeded,_size
+    from cachemonitor.prepared_store import _size
     engine=ProjectedEngine({('home',str(i)):[scalar_call(i)] for i in range(20)})
     original=project(engine,all_query())
     fold=engine._comparison_cache['fold']
@@ -587,10 +587,11 @@ def test_optional_fold_is_dropped_when_reader_limit_shrinks_and_can_be_rebuilt()
     assert exact_scalars(refreshed)==exact_scalars(original)
     assert engine._comparison_cache.get('fold') is None
     assert engine.read_metrics['comparison_cache_bytes']<=owner_bytes
-    published=engine._comparison_cache
     engine.reader.limits.page_objects_bytes=owner_bytes-1
-    with pytest.raises(CapacityExceeded):project(engine,all_query())
-    assert engine._comparison_cache is published
+    fallback=project(engine,all_query())
+    assert exact_scalars(fallback)==exact_scalars(original)
+    assert engine.read_metrics['comparison_cache_bytes']<owner_bytes
+    assert engine.read_metrics['comparison_working_peak_bytes']<owner_bytes
     engine.reader.limits.page_objects_bytes=LIMIT
     assert exact_scalars(project(engine,all_query()))==exact_scalars(original)
     assert engine._comparison_cache.get('fold') is not None
@@ -639,3 +640,95 @@ def test_tag_promotion_failure_does_not_publish_partial_append(monkeypatch):
     assert accepted['usage']['summary']['value']==9
     assert exact_scalars(project(engine,all_query())['usage'])==exact_scalars(
         project(ProjectedEngine(deepcopy(engine.owners)),all_query())['usage'])
+
+
+
+def capacity_owners(calls,owners,groups,*,model_chars=24,project_chars=32):
+    rows={('home',str(index)):[] for index in range(owners)}
+    identities=tuple(rows)
+    models=[f'model-{index:04d}'.ljust(model_chars,'m') for index in range(groups)]
+    projects=[f'project-{index:04d}'.ljust(project_chars,'p') for index in range(groups)]
+    for ordinal in range(calls):
+        owner=identities[ordinal%owners];group=ordinal%groups;value=ordinal+1
+        row=scalar_call(value)
+        row.update(home=owner[0],sid=owner[1],ts=value,key=f'call-{ordinal}',
+                   model=models[group],project=projects[group],project_name=projects[group],
+                   source='user',service_tier='default',cost=value/100000,
+                   output=value%100+1,reasoning=value%10,cached=0)
+        rows[owner].append(row)
+    return rows
+
+
+def test_owner_cache_overflow_falls_back_with_exact_cold_warm_append_and_correction_results():
+    from cachemonitor import comparison_usage as comparison
+    owners=capacity_owners(1008,63,4)
+    values=(0,-0.0,0.0,2**53+1,2**64-1,2**64,2**80+1,1e100)
+    for rows in owners.values():
+        for row in rows:
+            value=values[((row['ts']-1)//4)%len(values)]
+            row.update(input=value,output=value,cost=value,reasoning=value)
+            if row['ts']%7==0:row['reasoning']=None
+    q=all_query();q['usage']['dimension']='project'
+    reference=ProjectedEngine(deepcopy(owners));project(reference,q)
+    global_budget=comparison._Budget(comparison.LIMIT);groups={}
+    for rows in owners.values():
+        for row in rows:comparison.add_row(groups,row,'project',global_budget)
+    owner_bytes=max(512+comparison._size(owner)+comparison._size(entry['context'])
+                    +sum(256+comparison._size(key)+comparison._size(label)+value.clone_bytes()
+                         for key,(label,value) in entry['groups'].items())
+                    for owner,entry in reference._comparison_cache['entries'].items())
+    # Cached folding borrows all owner observations. Charge a complete global
+    # population and two owner clones alongside fold scratch and delivery.
+    # These object estimates do not measure process RSS.
+    allowance=(global_budget.peak+2*owner_bytes
+               +reference.read_metrics['comparison_working_peak_bytes']
+               +reference.read_metrics['comparison_result_bytes'])
+    assert owner_bytes<allowance<reference.read_metrics['comparison_cache_bytes']
+    del groups,reference
+    engine=ProjectedEngine(deepcopy(owners));engine.reader.limits.page_objects_bytes=allowance
+    owner=('home','0')
+    for phase in ('cold','warm','append','correction','removal'):
+        if phase=='append':
+            row=dict(engine.owners[owner][-1],key='appended',ts=1009,cost=2**64+3,reasoning=-0.0)
+            engine.replace(owner,engine.owners[owner]+[row],append=True)
+        elif phase=='correction':
+            rows=deepcopy(engine.owners[owner]);rows[0].update(cost=0.1,input=2**80+3,reasoning=7)
+            engine.replace(owner,rows)
+        elif phase=='removal':
+            engine.owners.pop(('home','1'));engine.revision+=1
+        expected=project(ProjectedEngine(deepcopy(engine.owners)),q)
+        actual=project(engine,q)
+        assert exact_scalars(actual['usage'])==exact_scalars(expected['usage']),phase
+        assert actual['analysis']==expected['analysis'],phase
+        assert engine.read_metrics['comparison_cache_bytes']<=allowance
+        assert engine.read_metrics['comparison_working_peak_bytes']<=allowance
+        assert engine.read_metrics['comparison_result_bytes']<=allowance
+
+
+@pytest.mark.extended
+def test_real_32_mib_owner_group_cache_overflow_keeps_complete_exact_results():
+    from cachemonitor import comparison_usage as comparison
+    owners=capacity_owners(8192,21,512,model_chars=256,project_chars=512)
+    engine=ProjectedEngine(owners);q=all_query();q['usage']['dimension']='project'
+    actual=project(engine,q)
+    assert comparison.LIMIT==32*1024*1024
+    assert actual['analysis']==dict(response_count=8192,session_count=21)
+    assert actual['usage']['summary']==dict(value=8192,known=8192,total=8192,partial=False)
+    rows={row['group']:row for row in actual['usage']['rows']}
+    assert len(rows)==512 and sum(row['metrics']['calls']['value'] for row in rows.values())==8192
+    total=comparison.Totals()
+    for owner_rows in owners.values():
+        budget=comparison._Budget(comparison.LIMIT);groups={}
+        for row in owner_rows:comparison.add_row(groups,row,'project',budget)
+        for _,aggregate in groups.values():total.merge(aggregate.totals)
+    assert exact_scalars(actual['usage']['metrics'])==exact_scalars(total.result())
+    for group,row in rows.items():
+        population={owner:[call for call in calls if call['project']==group]
+                    for owner,calls in owners.items()}
+        reference=project(ProjectedEngine(population),q)['usage']['rows'][0]
+        assert exact_scalars(row['metrics'])==exact_scalars(reference['metrics'])
+        assert exact_scalars(row['distributions'])==exact_scalars(reference['distributions'])
+        assert row['key']==reference['key'] and row['filters']==reference['filters']
+        assert row['group_label']==reference['group_label']
+    for name in ('comparison_cache_bytes','comparison_working_peak_bytes','comparison_result_bytes'):
+        assert engine.read_metrics[name]<=comparison.LIMIT
