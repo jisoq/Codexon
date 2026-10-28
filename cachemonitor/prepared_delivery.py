@@ -411,7 +411,7 @@ class PreparedPublisher:
         self.token=token;self.order_identity=order_identity;self.scoped=scoped
         self.overlay=overlay;self._projection_dirty=True
 
-    def _filter_choices(self,snapshot,sessions,view=None):
+    def _filter_choices(self,snapshot,view=None):
         counts=Counter();transports=set();transport_sources=set();policies=set()
         homes=set(snapshot.get('homes',()));sources=set();models=set();internal=0
         def metadata():
@@ -479,7 +479,7 @@ class PreparedPublisher:
                         candidate.pop('title')
                     candidates.append(candidate)
             if self._choices_dirty:
-                global_choices,internal,models=self._filter_choices(snapshot,sessions,view)
+                global_choices,internal,models=self._filter_choices(snapshot,view)
             else:
                 global_choices,internal,models=self.global_choices,self.internal_count,self.global_models
         overlays={(value['home'],value['id']):value for value in overlays}
