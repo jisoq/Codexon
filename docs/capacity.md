@@ -28,7 +28,7 @@ groups the changes by their owning stage.
 | Collection metadata, [usage_collection.py](../cachemonitor/usage_collection.py) and [collection_stream.py](../cachemonitor/collection_stream.py) | Whole-catalog 1 MiB header gate and durable status's 4 MiB compressed and 8 MiB plain header gates. | Page membership with a publication-bound cursor. Stream only status fields for status readers. Oversized optional 16 KiB proofs become unavailable without refusing the canonical body. |
 | Prepared storage, [prepared_store.py](../cachemonitor/prepared_store.py) | 1 GiB prepared-file lifetime admission, 32 MiB complete catalog admission, and redundant 16 KiB recovered-parent admission. | Store membership and conversion work in file-backed SQLite tables. Continue in bounded pages. Preserve source generations, lineage, and exact order. |
 | Query owners, [prepared_analysis.py](../cachemonitor/prepared_analysis.py) | The complete owner population had to fit 64 MiB. | Use 64 MiB as an optional metadata cache. Reload evicted entries from the pinned prepared generation. |
-| Quota synchronization, [prepared_ledger.py](../cachemonitor/prepared_ledger.py) and [quota_prepared_sync.py](../cachemonitor/quota_prepared_sync.py) | 64 MiB complete owner admission and 32 MiB cumulative certificate admission. | Stage population and coverage plans in file-backed temporary tables. Apply bounded cohorts under `loading=1`. Commit facts, request boundaries, and certificates atomically. Publish complete coverage after reconciliation. |
+| Quota synchronization, [prepared_ledger.py](../cachemonitor/prepared_ledger.py) and [quota_prepared_sync.py](../cachemonitor/quota_prepared_sync.py) | 64 MiB complete owner admission and 32 MiB cumulative certificate admission. | Stage population and coverage plans in file-backed temporary tables. Apply bounded cohorts under `loading=1`. Commit facts, request boundaries, and certificates atomically. Publish complete coverage after reconciliation. Durable exact-owner obligations survive shutdown and are acknowledged only after source-certificate confirmation. |
 | Quota recovery, [quota_backlog.py](../cachemonitor/quota_backlog.py) | Reject an individual observation above 64 KiB. A nearly full backlog could strand an admitted in-flight response. | Treat 64 KiB as a fetch reservation estimate. Preserve one admitted in-flight response through the existing unsaved slot. Pause new reads at backlog capacity and resume after replay. |
 | Comparison, [comparison_usage.py](../cachemonitor/comparison_usage.py) | An optional 32 MiB aggregate cache could refuse an otherwise valid query. | Compute the exact result without retaining that cache when it does not fit. Retain actual working and required-result guards. |
 | Independent cleanup | Duplicate 5,000-row evidence fetch default, unused 24-call arithmetic, duplicate ten-error dashboard buffer, and duplicate checkpoint pre-hash admission. | Keep the poll work owner, visible Trend policy, `ErrorState`, and source-packet admission. Removing duplicate validation does not enlarge the source-packet contract. |
@@ -117,14 +117,14 @@ own connections.
 
 ## Selected authority and integration status
 
-Prepared format 8 separates selected membership and relative order from the
+Prepared format 9 separates selected membership and relative order from the
 retained canonical population and global order. A selected result cannot retire
 unrelated facts or claim complete aggregate coverage. A selected overlay must
 resolve its family through the existing source index. Paging all history is not
 an overlay prerequisite. Aggregate consumers retain complete-membership work.
 See [prepared analysis cache](storage.md#prepared-analysis-cache).
 
-The format-8 core is implemented. Source selected-publication integration,
+The format-9 core and durable quota handoff are implemented. Source selected-publication integration,
 runtime consumers, and delivery corrections remain under integration and
 verification. This document does not certify a final source candidate, package,
 installation, live overlay recovery, or universal capacity. Exact-default

@@ -46,14 +46,14 @@ append checkpoints. These facts still serve comparison, performance, overlays,
 quota accounting, and saved mismatch capture after the session-record screen is
 removed. The mismatch archive preserves its own saved evidence independently.
 
-Prepared format 8 stores selected membership and relative order separately from
+Prepared format 9 stores selected membership and relative order separately from
 retained canonical facts and global order. A selected publication has partial
 authority. Omitted owners and previous family members remain stored. Selected
 order does not replace canonical correction order or the last complete global
 order. Cleanup preserves the global order and referenced selected order batches.
 A complete aggregate publication can install exact global order.
 
-Recognized earlier formats, including format 7, use the existing atomic cache
+Recognized earlier formats, including formats 7 and 8, use the existing atomic cache
 replacement and regenerate facts from their source owners. Only the recognized
 disposable prepared cache is replaced. This requires one cold preparation. An
 unchanged ready restart reuses the resulting cache. Append format 4 retains raw
@@ -66,6 +66,13 @@ lifetime file ceiling. Disk errors and the existing write and WAL guards remain.
 Quota certificates grow with the facts they certify. Facts, request boundaries,
 and certificates commit together, and synchronization confirms that commit before
 acknowledging the source.
+
+Each prepared publication records exact pending quota owners in the same durable
+transaction as its facts. The pending owner identities survive shutdown and
+maintenance. Quota synchronization confirms their source certificates before
+acknowledging the captured prepared generation. Explicit retirement removes its
+certificate while preserving quota call history. Selected omission is not a
+retirement receipt.
 
 The analysis writer stages catalog membership and owner work in file-backed
 SQLite tables. Aggregate work retains complete membership. Selected work uses
@@ -89,7 +96,7 @@ retained objects. Their defaults are separate from total history capacity.
 
 The [capacity policy](capacity.md) distinguishes removed population admissions
 from retained object guards, work slices, optional caches, and semantic values.
-Format-8 core ownership is implemented. Source selected-publication integration,
+Format-9 core ownership and durable quota handoff are implemented. Source selected-publication integration,
 runtime consumers, and delivery corrections remain under integration and
 verification. This storage description does not certify a final build or install.
 
