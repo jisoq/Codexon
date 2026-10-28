@@ -26,6 +26,7 @@ ORDER = tuple(LABELS)
 SUBAGENT_GAP = 19
 AGENT_ICON_SIZE = 12
 AGENT_ICON_GAP = 4
+AGENT_FRAME_INSET = 4
 
 def money(value):
     if value is None or not math.isfinite(value): return '—'
@@ -272,11 +273,12 @@ class Drawing:
         for part in re.findall(r'[KM$%]|[^KM$%]+',value):
             s=max(11,round(size*2/3)) if part in ('K','M','$','%') else size
             self.number(part,start,baseline,w,s,color);start+=QFontMetrics(font(family,s,600)).horizontalAdvance(part)
-    def rect(self,x,y,w,h,color,radius=0,alpha=None,pattern=False):
+    def rect(self,x,y,w,h,color,radius=0,alpha=None,pattern=False,*,outline=False):
         if w<=0 or h<=0:return
         p=self.p;c=QColor(self.colors.get(color,color))
         if alpha is not None:c.setAlphaF(alpha)
-        p.setPen(Qt.NoPen);p.setBrush(c)
+        if outline:p.setPen(QPen(c,1));p.setBrush(Qt.NoBrush)
+        else:p.setPen(Qt.NoPen);p.setBrush(c)
         if radius:p.drawRoundedRect(QRectF(x,y,w,h),radius,radius)
         else:p.drawRect(QRectF(x,y,w,h))
         if pattern:
@@ -325,6 +327,7 @@ def paint_items(d,items,top=0,bottom=math.inf):
                 offset+=length
         elif style.get('kind')=='tokens':d.tokens(x,y,w,title=value)
         elif style.get('kind')=='agent-update':d.row_glow(x,y,w,h,owner=style['owner'],color=style['color'])
+        elif style.get('kind')=='agent-frame':d.rect(x+.5,y+.5,w-1,h-1,'border',radius=5,alpha=.6,outline=True)
         elif style.get('kind')=='agent-separator':d.rect(x,y,w,h,'border',alpha=.45)
         elif style.get('kind')=='chevron':
             points=((x,y+8),(x+3,y+11),(x+6,y+8)) if style['expanded'] else ((x+1,y+7),(x+4,y+h/2),(x+1,y+13))
@@ -817,7 +820,7 @@ class OverlayContent(Node):
     def group_details(self,group,*,own=False):
         from .overlay_monitor import miss_text
         from .i18n import formatted
-        w=self.detail_width;items=[];y=0
+        w=self.detail_width-2*AGENT_FRAME_INSET;items=[];y=0
         def lines(value,width,size=11):
             value=tr(str(value));metrics=QFontMetrics(font(self.appearance.family,size));result=[];line=''
             for char in value:
@@ -827,7 +830,7 @@ class OverlayContent(Node):
             return result
         def add(value,x,top,width,*,right=False,color='ink',weight=400,size=11,marker=None):
             wrapped=lines(value,width,size);height=max(18,len(wrapped)*18)
-            items.append((wrapped if len(wrapped)>1 else wrapped[0],x,top,width,height,size,color,weight,
+            items.append((wrapped if len(wrapped)>1 else wrapped[0],x+AGENT_FRAME_INSET,top,width,height,size,color,weight,
                           dict(right=right,square=marker,tokenMarker=bool(marker))))
             return height
         def row(label,value,*,marker=None,total=False):
@@ -862,7 +865,7 @@ class OverlayContent(Node):
                 row(label,pair(count,price),marker=marker)
                 if price is not None and price>0:parts.append(dict(value=price,color=marker))
             if parts:
-                items.append(('',0,y,w,8,11,'ink',400,dict(kind='cost-bar',parts=parts,total=sum(p['value'] for p in parts))));y+=16
+                items.append(('',AGENT_FRAME_INSET,y,w,8,11,'ink',400,dict(kind='cost-bar',parts=parts,total=sum(p['value'] for p in parts))));y+=16
             y+=6
         if partial:
             add('확인분',0,y,w,color='secondary',size=11);y+=22
@@ -876,19 +879,20 @@ class OverlayContent(Node):
     def main_detail_height(self):
         return max((item[2]+item[4] for item in self.main_items()),default=0)+8 if self.main_expanded else 0
     def agent_cost_column(self,width):
-        width=min(width,self.detail_width)
+        width=min(width,self.detail_width)-2*AGENT_FRAME_INSET
         groups=[main_usage(self.data or {}),*(self.data or {}).get('subagent_finance',{}).get('agents',())]
         costs=[0 if group.get('calls')==0 else group.get('cost') for group in groups]
         costs.append((self.data or {}).get('child_cost'))
         metrics=QFontMetrics(font(self.appearance.family,12,600))
         available=width*.44
         price_width=min(available,max((metrics.horizontalAdvance(money(cost))+6 for cost in costs),default=0))
-        return width-6-price_width,price_width
+        return AGENT_FRAME_INSET+width-6-price_width,price_width
     def agent_summary_items(self,group,label,mark,expanded,width,*,main=False,cost_column=None):
         """Keep both agent scopes on the same summary and metric columns."""
         from .overlay_monitor import speed
         cost=0 if group.get('calls')==0 else group.get('cost')
         price_x,price_width=cost_column or self.agent_cost_column(width)
+        width-=2*AGENT_FRAME_INSET;price_x-=AGENT_FRAME_INSET
         price=money(cost)
         chevron_x=price_x+price_width-2
         name_x=AGENT_ICON_SIZE+AGENT_ICON_GAP
@@ -924,7 +928,7 @@ class OverlayContent(Node):
                  (speed(group.get('output_speed_summary',{}).get('value')),width*.75,width,True))
         items.extend((tr(text),left,47,right-left,18,12 if align else 11,'ink' if align else 'secondary',400,dict(kind='single-line',right=align))
                      for text,left,right,align in metrics)
-        return items
+        return [(item[0],item[1]+AGENT_FRAME_INSET,*item[2:]) for item in items]
     @staticmethod
     def agent_summary_height(items):return max(AGENT_SUMMARY_HEIGHT,max((item[2]+item[4] for item in items),default=0))
     def detail_items(self):
@@ -937,6 +941,7 @@ class OverlayContent(Node):
         for index,group in enumerate(self.detail_groups()):
             key=group['key'];expanded=key in self.expanded_groups;start=y
             if index:items.append(('',0,y-8,w,1,11,'ink',400,dict(kind='agent-separator')))
+            section_index=len(items)
             agent=(group.get('home'),group.get('id'));mark=agent_mark(agent[1],self.appearance)
             summary=self.agent_summary_items(group,group['label'],mark,expanded,w,cost_column=cost_column)
             summary_height=self.agent_summary_height(summary)
@@ -955,6 +960,7 @@ class OverlayContent(Node):
                 for item in details:items.append((*item[:2],item[2]+y,*item[3:]))
                 detail_height=max((item[2]+item[4] for item in details),default=0)+8
                 self._sub_expanded_height+=detail_height;y+=detail_height
+                items.insert(section_index,('',0,start,w,y-start,11,'border',400,dict(kind='agent-frame')))
             y+=SUBAGENT_GAP
         return items
     def headline_metrics(self):

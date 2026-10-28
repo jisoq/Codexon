@@ -192,6 +192,8 @@ def paint(d,m):
     displayed=m.displayed_call()
     for (key,label),y in zip(CHARTS,g['charts']):_chart(d,m,rows,key,label,y,g['chart_height'],displayed)
     y=g['main'];mark=agent_mark(data.get('id'),m.appearance)
+    if m.main_expanded:
+        paint_items(d,[('',MARGIN,y,SECTION_WIDTH,g['main_height']+g['main_detail_height'],11,'border',400,dict(kind='agent-frame'))])
     d.row_glow(MARGIN,y,SECTION_WIDTH,g['main_height'],owner=(data.get('home'),data.get('id')),color=mark.color)
     d.line(MARGIN,y-6,RIGHT,y-6)
     paint_items(d,[(item[0],item[1]+MARGIN,item[2]+y,*item[3:])
