@@ -587,7 +587,7 @@ class Dashboard(TrayWindow):
 
     def render(self,*_,automatic=False):
         if self.restoring or not hasattr(self,'settings_page'):return
-        if self.async_mode and (not self.isVisible() or self.isMinimized()):
+        if (self.async_mode or automatic) and (not self.isVisible() or self.isMinimized()):
             self._display_dirty=True;return
         if self.current_page==7:
             self.mismatch_page.refresh(automatic=automatic)

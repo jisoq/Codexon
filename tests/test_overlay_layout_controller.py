@@ -58,7 +58,8 @@ def test_initial_preparation_body_is_visible_and_updates_in_native_overlay(tmp_p
         assert controller.reduced_motion
         labels=[item for item in walk(controller.widget.quick.rootObject()) if item.objectName()=='overlayHeartbeatLabel']
         assert len(labels)==1 and not labels[0].isVisible()
-        assert ('Usage will appear' if language=='en' else '저장된 사용 기록') in model.state['accessible']
+        assert controller.preparation.progress is PreparationStage.COLLECTING
+        assert ('Reading saved' if language=='en' else '저장된 Codex 사용 기록') in model.state['accessible']
         assert not any(('other tabs' if language=='en' else '다른 탭') in line for line in model.lines())
         assert controller.widget.quick.grabFramebuffer().save(str(tmp_path/f'initial-overlay-{language}-{scale}.png'))
         pending=replace(pending,progress=PreparationWork(PreparationStage.CONVERTING,16,49))
@@ -97,6 +98,10 @@ def test_initial_preparation_body_is_visible_and_updates_in_native_overlay(tmp_p
         controller.receive_overlay_fault({'publication_failed':True})
         assert model.preparation is None and model.heartbeat_state()['mode']=='error'
         controller.receive_snapshot({'overlay_sessions':[],'index':{'loading':False},'ts':time.time()})
+        assert controller.preparation is not None
+        controller.receive_snapshot({'overlay_sessions':[],'index':{'loading':False},'ts':time.time(),
+            'catalog_complete':True,'session_catalog':[],
+            'demand':dict(selected=[[None,A]],aggregate=False,evidence=[])})
         assert controller.preparation is None and model.preparation is None
         controller.receive_preparation(pending)
         controller.receive_target({'target':{'hwnd':1},'selection':Selection(A,host='remote:test')})
@@ -112,7 +117,7 @@ def test_initial_preparation_body_is_visible_and_updates_in_native_overlay(tmp_p
 def test_collection_error_does_not_advance_last_confirmed_time(monkeypatch):
     from types import SimpleNamespace
     from cachemonitor import overlay
-    state=SimpleNamespace(snapshot_wall_time=100.,refresh=lambda:None)
+    state=SimpleNamespace(snapshot_wall_time=100.,target_state={},refresh=lambda:None)
     monkeypatch.setattr(overlay.time,'time',lambda:200.)
     OverlayController.receive_snapshot(state,{'errors':['collection failed']})
     assert state.snapshot_wall_time==100.
