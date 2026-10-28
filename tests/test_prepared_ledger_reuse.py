@@ -262,3 +262,149 @@ def test_different_store_instance_never_reuses_equal_batch_number(tmp_path):
         sources,_=adapter._sources()
         assert sources[('home','first')]['title'] == 'first-2'
         assert adapter.metrics['metadata_reads'] == 2
+
+
+
+def test_certificate_population_does_not_refuse_authoritative_facts(tmp_path, monkeypatch):
+    monkeypatch.setattr(progress, 'MAX_BYTES', 1024, raising=False)
+    owners = [('home', 'first'), ('home', 'second')]
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1, 'second': 2})
+        adapter = delivery.PreparedLedger(ledger, store)
+        _, expected = adapter._sources()
+        updates = list(adapter.sync(_envelope()))
+        assert {owner for update in updates for owner in update['owners']} == set(owners)
+        assert progress.applied(ledger.db, owners) == expected
+        assert [tuple(row) for row in ledger.db.execute('SELECT sid,cost FROM calls ORDER BY sid')] == [
+            ('first', .1), ('second', .2)]
+        assert [tuple(row) for row in ledger.db.execute(
+            'SELECT uid,started FROM tracking_call_boundaries ORDER BY uid')] == [
+            ('first-call', 90), ('second-call', 90)]
+        assert list(adapter.sync(_envelope(201)))[0]['owners'] == ()
+        assert progress.applied(ledger.db, owners) == expected
+
+
+def test_legacy_certificate_budget_is_removed_without_losing_valid_progress(tmp_path):
+    owners = [('home', 'first'), ('home', 'second')]
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        committed = progress.applied(ledger.db, owners)
+        ledger.db.execute('CREATE TABLE IF NOT EXISTS prepared_analysis_budget(id INTEGER PRIMARY KEY,bytes INTEGER NOT NULL)')
+        ledger.db.execute('INSERT OR REPLACE INTO prepared_analysis_budget VALUES(1,548)')
+        for name in ('prepared_applied_admit', 'prepared_applied_insert', 'prepared_applied_delete'):
+            ledger.db.execute(f'DROP TRIGGER IF EXISTS {name}')
+        ledger.db.execute("CREATE TRIGGER prepared_applied_admit BEFORE INSERT ON prepared_analysis_applied BEGIN "
+            "SELECT CASE WHEN (SELECT bytes FROM prepared_analysis_budget WHERE id=1)"
+            "+(512+4*length(new.home)+4*length(new.sid))>1024 "
+            "THEN RAISE(ABORT,'prepared ledger progress exceeds its metadata budget') END; END")
+        ledger.db.execute('CREATE TRIGGER prepared_applied_insert AFTER INSERT ON prepared_analysis_applied BEGIN '
+            'UPDATE prepared_analysis_budget SET bytes=bytes+(512+4*length(new.home)+4*length(new.sid)) WHERE id=1; END')
+        ledger.db.execute('CREATE TRIGGER prepared_applied_delete AFTER DELETE ON prepared_analysis_applied BEGIN '
+            'UPDATE prepared_analysis_budget SET bytes=bytes-(512+4*length(old.home)+4*length(old.sid)) WHERE id=1; END')
+        ledger.db.commit()
+        progress.initialize(ledger.db)
+        progress.initialize(ledger.db)
+        assert progress.applied(ledger.db, owners) == committed
+        assert ledger.db.execute("SELECT name FROM sqlite_master WHERE name IN "
+            "('prepared_analysis_budget','prepared_applied_admit','prepared_applied_insert','prepared_applied_delete')").fetchall() == []
+        _publish(store, 2, {'second': 2})
+        list(adapter.sync(_envelope(201)))
+        _, expected = adapter._sources()
+        assert progress.applied(ledger.db, owners) == expected
+        assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 2
+        assert ledger.db.execute('SELECT count(*) FROM tracking_call_boundaries').fetchone()[0] == 2
+
+
+def test_certificate_failure_rolls_back_candidate_facts_and_preserves_previous_owner(tmp_path, monkeypatch):
+    import sqlite3
+
+    owners = [('home', 'first'), ('home', 'second')]
+    path = tmp_path/'quota.sqlite'
+    with closing(QuotaLedger(path)) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        committed = progress.applied(ledger.db, owners)
+        _publish(store, 2, {'second': 2})
+        original = progress.save
+        def fail_after_certificate(db, certificates):
+            original(db, certificates)
+            assert db.execute("SELECT count(*) FROM calls WHERE sid='second'").fetchone()[0] == 1
+            assert db.execute("SELECT count(*) FROM tracking_call_boundaries WHERE uid='second-call'").fetchone()[0] == 1
+            assert progress.applied(db, [('home', 'second')]) == certificates
+            raise RuntimeError('injected interruption before commit')
+        with monkeypatch.context() as interrupted:
+            interrupted.setattr(progress, 'save', fail_after_certificate)
+            with pytest.raises(RuntimeError, match='injected interruption'):
+                list(adapter.sync(_envelope(201)))
+        assert ledger.db.in_transaction
+        with closing(sqlite3.connect(path)) as reader:
+            assert reader.execute('SELECT sid FROM calls').fetchall() == [('first',)]
+            assert reader.execute('SELECT uid FROM tracking_call_boundaries').fetchall() == [('first-call',)]
+            assert dict(((home, sid), stamp) for home, sid, stamp in reader.execute(
+                'SELECT home,sid,signature FROM prepared_analysis_applied')) == committed
+        ledger.db.rollback()
+        assert progress.applied(ledger.db, owners) == committed
+        assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 1
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope(202)))
+        _, expected = adapter._sources()
+        assert progress.applied(ledger.db, owners) == expected
+        assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 2
+
+
+@pytest.mark.parametrize('certificate', [None, '0'*64])
+def test_sync_requires_positive_postcommit_certificate_confirmation(tmp_path, monkeypatch, certificate):
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1})
+        adapter = delivery.PreparedLedger(ledger, store)
+        original = progress.save
+        def lose_certificate(db, certificates):
+            if certificate is not None:
+                original(db, {owner: certificate for owner in certificates})
+        monkeypatch.setattr(progress, 'save', lose_certificate)
+        with pytest.raises(ValueError, match='unconfirmed or older recovery owners'):
+            next(adapter.sync(_envelope()))
+        assert not ledger.db.in_transaction
+        assert ledger.db.execute('SELECT count(*) FROM calls').fetchone()[0] == 1
+        assert ledger.db.execute('SELECT count(*) FROM tracking_call_boundaries').fetchone()[0] == 1
+        assert adapter.metrics['applied_owners'] == 0
+        assert adapter.task_revisions == {}
+
+
+@pytest.mark.parametrize('mutation', [
+    "UPDATE calls SET cost=99 WHERE sid='first'",
+    "DELETE FROM calls WHERE sid='first'",
+    "INSERT OR REPLACE INTO calls SELECT home,uid,'second',ts,model,input,cached,written,output,reasoning,cost,price_id,signature,service_tier FROM calls WHERE sid='first'",
+    "UPDATE tracking_call_boundaries SET started=80 WHERE uid='first-call'",
+    "DELETE FROM tracking_call_boundaries WHERE uid='first-call'",
+    "INSERT OR REPLACE INTO tracking_call_boundaries VALUES('home','first-call',80)",
+])
+def test_certificate_invalidation_survives_budget_migration(tmp_path, mutation):
+    owner = ('home', 'first')
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        progress.initialize(ledger.db)
+        assert owner in progress.applied(ledger.db, [owner])
+        ledger.db.execute(mutation)
+        ledger.db.commit()
+        assert progress.applied(ledger.db, [owner]) == {}
+
+
+def test_append_still_requires_exact_committed_certificate(tmp_path):
+    owner = ('home', 'first')
+    with closing(QuotaLedger(tmp_path/'quota.sqlite')) as ledger, storage.PreparedStore(tmp_path/'prepared.sqlite') as store:
+        _publish(store, 1, {'first': 1})
+        adapter = delivery.PreparedLedger(ledger, store)
+        list(adapter.sync(_envelope()))
+        committed = progress.applied(ledger.db, [owner])
+        with pytest.raises(progress.AppendPredecessorChanged):
+            progress.require_append(ledger.db, {owner: dict(
+                format=progress.APPEND_FORMAT, count=1, prior_source='0'*64, policy=(None, None))})
+        ledger.db.rollback()
+        assert progress.applied(ledger.db, [owner]) == committed
+        assert ledger.db.execute('SELECT cost FROM calls').fetchone()[0] == .1
