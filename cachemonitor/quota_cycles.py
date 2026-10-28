@@ -1563,17 +1563,12 @@ class QuotaLedger:
             'unclassified=excluded.unclassified,complete_at=excluded.complete_at',
             (home, snapshot['ts'], loading, unclassified, watermark))
 
-    def _recovered_home(self, home, snapshot, *, prepared_plan=False):
+    def _recovered_home(self, home, snapshot):
         if not snapshot.get('collection_recovery'):
             return False
         state = self.db.execute('SELECT at FROM state WHERE home=?', (home,)).fetchone()
         health = self.db.execute('SELECT at FROM tracking_health WHERE home=?', (home,)).fetchone()
-        health_at = health[0] if health else None
-        if prepared_plan:
-            own = self.db.execute('SELECT activity_at FROM temp.prepared_ledger_homes WHERE home=?', (home,)).fetchone()
-            if own and own[0] == snapshot['ts'] and health_at == snapshot['ts']:
-                health_at = None
-        latest = max((at for at in (state[0] if state else None, health_at) if at is not None), default=None)
+        latest = max((row[0] for row in (state, health) if row and row[0] is not None), default=None)
         return latest is not None and latest >= snapshot['ts']
 
     def stage_prepared_coverage(self, source):
@@ -1629,7 +1624,7 @@ class QuotaLedger:
                 return
             for home, unclassified, pending in homes:
                 check()
-                if self._recovered_home(home, snapshot, prepared_plan=True):
+                if self._recovered_home(home, snapshot):
                     continue
                 errors = self._coverage_errors(snapshot)
                 if errors:
@@ -1640,7 +1635,7 @@ class QuotaLedger:
 
                 def require_current():
                     check()
-                    if self._recovered_home(home, snapshot, prepared_plan=True):
+                    if self._recovered_home(home, snapshot):
                         raise ValueError('newer recovery state replaced the prepared coverage plan')
 
                 def begin_loading():
@@ -1723,11 +1718,12 @@ class QuotaLedger:
             # newer evidence, including evidence committed by another writer.
             if not self.db.in_transaction:self.db.execute('BEGIN IMMEDIATE')
             for home in snapshot.get('homes',[]):
-                if self._recovered_home(home,snapshot,prepared_plan=prepared_plan):recovered_homes.add(home)
+                if self._recovered_home(home,snapshot):recovered_homes.add(home)
             if recovered_homes:
                 snapshot={**snapshot,'homes':[home for home in snapshot['homes'] if home not in recovered_homes]}
         if not hasattr(self,'_tracking_sync_cache'):self._tracking_sync_cache={}
-        sync_activity(self.db, snapshot,self._tracking_sync_cache)
+        sync_activity(self.db, snapshot,self._tracking_sync_cache,
+                      update_health=not (prepared_plan and snapshot.get('collection_recovery')))
         certificates={}
         for key, session in {**engine.sessions,**getattr(engine,'internal_sessions',{})}.items():
             if key[0] in recovered_homes or key in pending:continue
@@ -1834,10 +1830,6 @@ class QuotaLedger:
         if applied_sources is not None:
             from .quota_prepared_sync import save
             save(self.db,certificates)
-        if prepared_plan:
-            self.db.executemany('UPDATE temp.prepared_ledger_homes SET activity_pending=? WHERE home=? '
-                'AND EXISTS(SELECT 1 FROM tracking_health WHERE home=? AND at=?)',
-                ((snapshot['ts'],home,home,snapshot['ts']) for home in snapshot.get('homes',())))
         self.db.commit()
         self._compact_cost_archive()
         self._payload_migration.step()

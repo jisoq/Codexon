@@ -56,10 +56,7 @@ class PreparedLedger:
                 ON prepared_ledger_sources((call_waiting OR task_waiting),ordinal);
             CREATE TEMP TABLE prepared_ledger_homes(
                 home TEXT PRIMARY KEY,policy BLOB NOT NULL,active INTEGER NOT NULL,scope INTEGER NOT NULL,
-                unclassified INTEGER NOT NULL DEFAULT 0,pending_count INTEGER NOT NULL DEFAULT 0,
-                activity_at REAL,activity_pending REAL);
-            CREATE INDEX temp.prepared_ledger_activity ON prepared_ledger_homes(activity_pending)
-                WHERE activity_pending IS NOT NULL;
+                unclassified INTEGER NOT NULL DEFAULT 0,pending_count INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX temp.prepared_ledger_scope ON prepared_ledger_homes(scope,home);
             CREATE TEMP TABLE prepared_ledger_coverage(
                 home TEXT NOT NULL,sid TEXT NOT NULL,start REAL,end REAL,reason TEXT NOT NULL,
@@ -181,12 +178,6 @@ class PreparedLedger:
             db.commit()
             after = tuple(rows[-1])
         return token
-
-    def _confirm_activity(self):
-        db = self.ledger.db
-        db.execute('UPDATE temp.prepared_ledger_homes SET activity_at=activity_pending,activity_pending=NULL '
-                   'WHERE activity_pending IS NOT NULL')
-        db.commit()
 
     @staticmethod
     def _require_view(view, expected=None):
@@ -467,7 +458,7 @@ class PreparedLedger:
                 db.execute('BEGIN IMMEDIATE')
                 self._check_plan(token)
                 retired = tuple(tuple(row) for row in rows
-                    if not self.ledger._recovered_home(row[0], envelope, prepared_plan=True))
+                    if not self.ledger._recovered_home(row[0], envelope))
                 progress.retire(db, retired)
                 db.executemany('DELETE FROM temp.prepared_ledger_retired WHERE home=? AND sid=?',
                                (tuple(row) for row in rows))
@@ -549,7 +540,6 @@ class PreparedLedger:
             saved = progress.applied(db, selected)
             if any(saved.get(key) != stamp for key, stamp in selected.items()):
                 raise ValueError('unconfirmed or older recovery owners were not applied to the ledger')
-            self._confirm_activity()
             if not envelope.get('collection_recovery'):
                 db.executemany('INSERT INTO temp.prepared_ledger_requests VALUES(?,?,?,?) '
                     'ON CONFLICT(home,sid) DO UPDATE SET request_digest=excluded.request_digest,policy=excluded.policy',
@@ -567,7 +557,6 @@ class PreparedLedger:
             self._check_plan(token)
             self.ledger.sync(SimpleNamespace(sessions={}, internal_sessions={}),
                              dict(envelope, sessions=[], collection_partial=True), applied_sources={}, prepared_plan=True)
-            self._confirm_activity()
             yield dict(owners=(), remaining=True, retired=())
         for _ in self.ledger.reconcile_prepared_coverage(envelope, check=lambda: self._check_plan(token),
                                                        metadata_bytes=METADATA_BYTES):
