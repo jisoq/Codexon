@@ -216,20 +216,22 @@ def test_benchmark_watcher_keeps_activity_until_owner_replay_finishes(tmp_path,m
 def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_path):
     import multiprocessing as mp
     from cachemonitor.analysis_worker import process_main
-    from test_overlay import source
-    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
-    writer.start_live()
+    from cachemonitor.usage_collection import CollectorService
+    from test_core import fixture_home
+    home,_=fixture_home(tmp_path)
+    service=CollectorService([home],tmp_path/'index.sqlite');writer=service.channel
     context=mp.get_context('spawn');parent,child=context.Pipe()
     process=context.Process(target=process_main,args=(child,writer.homes,writer.path),
         kwargs={'quota_path':tmp_path/'quota.sqlite'})
     try:
-        value=snapshot(writer,time.time());session=source();session['home']=writer.homes[0]
-        value['sessions']=[session];writer.publish(value,'epoch',1)
+        service.poll(detailed=False)
         process.start();child.close()
         deadline=time.monotonic()+15
         while True:
             remaining=deadline-time.monotonic()
-            assert remaining>0 and parent.poll(remaining)
+            assert remaining>0
+            service.poll(detailed=False)
+            if not parent.poll(min(.05,remaining)):continue
             first=parent.recv()
             if first['kind']=='progress':
                 assert first.get('scope')=='startup',first
@@ -237,13 +239,13 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
             assert first['kind']=='snapshot',first
             if first['value'].get('ledger_status_known'):break
         wait_until(lambda:bool(writer.live.waiters))
-        changed=copy.deepcopy(value);changed['ts']+=.25
-        started=time.perf_counter();writer.publish(changed,'epoch',2)
+        changed_at=first['value']['ts']+.25
+        started=time.perf_counter();service.poll(now=changed_at,detailed=False)
         while True:
             remaining=1-(time.perf_counter()-started)
             assert remaining>0 and parent.poll(remaining)
             second=parent.recv();assert second['kind']=='snapshot'
-            if second['value']['ts']==changed['ts']:break
+            if second['value']['ts']==changed_at:break
         assert not second['value']['sessions'] and not second['value']['overlay_sessions']
         assert not second['value']['model_candidates'] and not second['value']['cache_candidates']
         assert time.perf_counter()-started<1
@@ -256,7 +258,7 @@ def test_analyzer_publication_wakes_before_timer_and_freeze_reclaims_waiter(tmp_
         if process.pid and process.is_alive():
             parent.send({'kind':'stop'});process.join(3)
             if process.is_alive():process.terminate();process.join()
-        parent.close();child.close();writer.close()
+        parent.close();child.close();service.close()
 
 
 def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monkeypatch,tmp_path):
@@ -289,6 +291,8 @@ def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monke
             super().__init__(*args,**kwargs)
     monkeypatch.setattr(prepared_runtime,'QuotaLedger',Ledger)
     with PreparedAnalysis(tmp_path,at=100.) as worker:
+        query=dict(page=2,start=99,end=200,now=200,period='custom',include_whole_history=False)
+        worker.parent.send(dict(kind='query',id=1,query=query,logical='initial-source'))
         worker.wait_snapshot(lambda value:value.get('ledger_error'))
         target[0]=105.
         recovered=worker.wait_snapshot(lambda value:value.get('ledger_status_known') and not value.get('ledger_error'))
@@ -319,7 +323,6 @@ def test_quiet_notifications_preserve_staleness_and_ledger_retry_deadlines(monke
         assert disconnected['prepared_token'][1]>=fresh['prepared_token'][1]
         assert disconnected['overlay_sessions'][0]['_overlay_revision']==revision
         worker.assert_calls_and_detail()
-        query=dict(page=2,start=99,end=200,now=200,period='custom',include_whole_history=False)
         worker.parent.send(dict(kind='query',id=2,query=query,logical='stale-source'))
         result=worker.wait_for(lambda value:value.get('id')==2 and value.get('kind')=='result')
         assert result['kind']=='result' and result['result']['prepared_token'][0]==token[0]

@@ -364,7 +364,7 @@ def test_writer_first_selection_after_idle_wakes_on_source_completion(tmp_path,m
     target=tmp_path/'index.sqlite';receiver=SnapshotReceiver()
     change_selection=Event();wake_consumed=Event();resume_writer=Event();pending=Event()
     consume_notification=CollectionClient.consume_notification
-    poll_catalog=CollectionClient.poll_catalog
+    poll_selection=CollectionClient.poll_selection
     def consume(client,*args,**kwargs):
         notice=consume_notification(client,*args,**kwargs)
         if notice is True and change_selection.is_set():
@@ -372,14 +372,14 @@ def test_writer_first_selection_after_idle_wakes_on_source_completion(tmp_path,m
             wake_consumed.set()
             assert resume_writer.wait(10)
         return notice
-    def catalog(client,*args,**kwargs):
-        value=poll_catalog(client,*args,**kwargs)
-        if ([None,TID] in client.active_demand['selected']
-                and [None,TID] not in value['header'].get('demand',{}).get('selected',())):
-            pending.set()
-        return value
+    def selection(client,*args,**kwargs):
+        try:return poll_selection(client,*args,**kwargs)
+        except CollectionCatalogUnavailable as error:
+            if error.reason=='selected_pending' and [None,TID] in client.active_demand['selected']:
+                pending.set()
+            raise
     monkeypatch.setattr(CollectionClient,'consume_notification',consume)
-    monkeypatch.setattr(CollectionClient,'poll_catalog',catalog)
+    monkeypatch.setattr(CollectionClient,'poll_selection',selection)
     with closing(CollectorService([home],target)) as service,\
             closing(PreparedWriter([home],target,None,tmp_path/'quota.sqlite')) as writer:
         idle=publication(service,writer,receiver,lambda value:value.get('catalog_complete')
@@ -542,6 +542,26 @@ def test_selected_family_and_actual_mode_ancestor_are_the_only_admitted_historie
                 assert row['service_tier']=='Fast'
             assert {source['id'] for source in enriched['sessions']}=={TID,CHILD,NEW}
             assert OTHER not in reads.bodies and OTHER not in reads.cached
+
+
+def test_selected_writer_completes_with_empty_mode_ancestor_outside_family(tmp_path):
+    home,_=fixture_home(tmp_path)
+    write_session(home,TID,count=0,mode=None)
+    write_session(home,CHILD,parent=TID,mode=None)
+    target=tmp_path/'index.sqlite';receiver=SnapshotReceiver()
+    with closing(CollectorService([home],target)) as service,\
+            closing(PreparedWriter([home],target,None,tmp_path/'quota.sqlite')) as writer:
+        writer.set_selected([(None,CHILD)])
+        current=publication(service,writer,receiver,lambda value:
+            any(row['id']==CHILD and row['calls']==1 for row in value['overlay_sessions']))
+        assert {row['id'] for row in current['sessions']}=={CHILD}
+        assert {row['id'] for row in current['overlay_sessions']}=={CHILD}
+        assert [str(home),TID] in service.channel.live.requested_demand(time.time())['evidence']
+        parent=next(row for row in service.last['sessions'] if row['id']==TID)
+        assert parent['collection_complete']
+        detail,_=selected_detail(service,writer,receiver,current,CHILD,'empty-mode-ancestor')
+        assert detail['summary']['calls']==1
+        assert detail['summary']['latest']['service_tier']=='미확인'
 
 
 def test_writer_keeps_selected_detail_live_until_explicit_aggregate_completes_and_preserves_ledger(tmp_path,monkeypatch):
