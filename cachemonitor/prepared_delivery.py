@@ -275,7 +275,7 @@ class PreparedPublisher:
                 signature=unpack(row['signature'],self._alert_store.limits)
                 pending_alerts[(key,row['identity'])]=dict(home=key[0],sid=key[1],title=row['title'],
                     **dict(zip(MODEL_KEYS,signature)))
-        changed=set(self.owners)
+        changed=self.changed|self.owners.keys()
         sessions={};overlays={}
         retention=self._admit(pending_alerts=pending_alerts,sessions=sessions,overlays=overlays,changed=changed)
         self.epoch=uuid.uuid4().hex
@@ -301,10 +301,13 @@ class PreparedPublisher:
         prior_work=self._alert_work
         next_work=prior_work
         try:
-            with store.read_current(seconds=60) as view:
+            with (store.read_current(seconds=60) as view,
+                  store.read_current(seconds=60,selected=scoped) as owner_view):
+                if owner_view.token!=view.token:
+                    raise NotReady('publication projections belong to different generations')
                 if not view.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]:
                     raise NotReady('cannot deliver a partial owner conversion')
-                order_identity=(view.token.instance,view.order_batch)
+                order_identity=(owner_view.token.instance,owner_view.order_batch)
                 if (self.token is not None and not changed and not removed and same_scope
                         and self.order_identity==order_identity):
                     self.token=view.token
@@ -316,15 +319,13 @@ class PreparedPublisher:
                 owners={};choices={};alerts={};weights={};owner_bytes=0
                 pending_alerts=self.pending_alerts.copy();content_changed=set()
                 overlay=self.overlay._fork()
-                entries=(((tuple(key),view.owner(*key,publication=True)) for key in selected)
-                         if not scan_alerts and scoped else
-                         ((row['owner'],row) for row in view.pages(view.catalog,publication=True)))
-                for key,row in entries:
-                    if row is None:
-                        raise NotReady('published selection references an absent prepared owner')
-                    new_alerts=row['model_alerts'] or {}
-                    metadata=row['metadata']
-                    if scan_alerts:
+                notification_changed=set()
+                if scan_alerts:
+                    for row in view.pages(view.publication_heads):
+                        key=row['owner'];metadata=row['metadata']
+                        new_alerts=row['model_alerts'] or {}
+                        if not metadata.get('_internal_review') and (self.token is None or key in changed):
+                            notification_changed.add(key)
                         if new_alerts:
                             database.execute('INSERT INTO delivery_alert_owners VALUES(?,?,?,?,?)',
                                 (next_work,*key,metadata.get('title',''),int(bool(metadata.get('_internal_review')))))
@@ -345,7 +346,14 @@ class PreparedPublisher:
                                     signature=tuple(record.get(name) for name in MODEL_KEYS)
                                 pending_alerts[(key,identity)]=dict(home=key[0],sid=key[1],
                                     title=metadata.get('title',''),**dict(zip(MODEL_KEYS,signature)))
+                entries=(((row['owner'],row) for row in owner_view.pages(owner_view.catalog,publication=True))
+                         if owner_view.selected or not scoped else
+                         ((tuple(key),owner_view.owner(*key,publication=True)) for key in selected))
+                for key,row in entries:
+                    if row is None:
+                        raise NotReady('published selection references an absent prepared owner')
                     if scoped and key not in selected:continue
+                    metadata=row['metadata'];new_alerts=row['model_alerts'] or {}
                     owner_choices=row['choices'] or {}
                     summary=row['summary']
                     entry={name:value for name,value in row.items()
@@ -375,19 +383,15 @@ class PreparedPublisher:
                         weight=_weight((key,entry,owner_choices,new_alerts),self.STATE_BYTES)
                         content_changed.add(key)
                         if not metadata.get('_internal_review') and isinstance(summary,dict) and 'owner' in summary:
-                            overlay.prime(view,key,summary,preserve_content=preserve_content)
+                            overlay.prime(owner_view,key,summary,preserve_content=preserve_content)
                     owner_bytes+=weight
                     if owner_bytes>self.STATE_BYTES:
                         raise CapacityExceeded('prepared publication metadata exceeds its retention budget')
                     owners[key]=entry;choices[key]=owner_choices;alerts[key]=new_alerts;weights[key]=weight
                 if scoped:
                     if len(owners)!=len(selected):raise NotReady('selected publication membership is incomplete')
-                elif self.token is not None:
-                    if (any(key not in self.owners and key not in changed for key in owners)
-                            or any(key not in owners and key not in removed for key in self.owners)):
-                        raise NotReady('catalog order does not match adopted publication owners')
                 token=view.token
-            changed=(self.changed & owners.keys())|content_changed
+            changed=(self.changed-set(removed))|notification_changed|content_changed
             retention=self._admit(owners=owners,choices=choices,alerts=alerts,weights=weights,overlay=overlay,
                                   pending_alerts=pending_alerts,changed=changed)
         except BaseException:
@@ -412,8 +416,10 @@ class PreparedPublisher:
         homes=set(snapshot.get('homes',()));sources=set();models=set();internal=0
         def metadata():
             nonlocal internal
+            complete_choices=self.scoped and not view.db.execute(
+                'SELECT selection_batch FROM meta WHERE singleton=1').fetchone()[0]
             entries=((row['owner'],row['metadata'],row['choices'] or {},row['dependencies'])
-                     for row in view.pages(view.catalog,publication=True)) if self.scoped else (
+                     for row in view.pages(view.catalog,publication=True)) if complete_choices else (
                      (key,row['metadata'],self.choices[key],row['dependencies']) for key,row in self.owners.items())
             for key,owner,choices,dependency in entries:
                 if owner.get('_internal_review'):
@@ -464,10 +470,10 @@ class PreparedPublisher:
             overlays=overlay.collect(view,self.owners,
                 None if sequence==1 else self.changed,self.sessions.keys()-sessions.keys(),speeds or {},
                 bind_generation=False)
-            from .prepared_health import notification_health
-            candidates=[notification_health(view,key,own=overlay.own[key],
-                                            revision=overlay.revisions[key],since=self.cache_floor)
-                        for key in sessions if key in self.changed]
+            from .prepared_health import notification_health_pages
+            candidates=[candidate for key in self.changed
+                        if key not in self.owners or not self.owners[key]['metadata'].get('_internal_review')
+                        for candidate in notification_health_pages(view,key,since=self.cache_floor)]
             if self._choices_dirty:
                 global_choices,internal,models=self._filter_choices(snapshot,sessions,view)
             else:
@@ -496,6 +502,8 @@ class PreparedPublisher:
 
     def publish_pages(self,snapshot,store,speeds=None):
         """Deliver one admitted result through bounded, atomically consumed fragments."""
+        from .analysis_engine import retained_bytes
+
         message=self.publish(snapshot,store,speeds)
         arrays=('sessions','overlay_sessions','removed','model_candidates','cache_candidates','models')
         metadata={key:value for key,value in message.items()
@@ -515,31 +523,64 @@ class PreparedPublisher:
                 if isinstance(values,list):
                     if not values:yield 'filter_choices',name,[]
                     for value in values:yield 'filter_choices',name,[value]
+                elif name=='project_paths':
+                    if not values:yield 'filter_choices',name,{}
+                    for project,paths in values.items():
+                        if not paths:yield 'filter_choices',name,{project:[]}
+                        for path in paths:yield 'filter_choices',name,{project:[path]}
                 elif isinstance(values,dict):
                     if not values:yield 'filter_choices',name,{}
                     for key,value in values.items():yield 'filter_choices',name,{key:value}
                 else:yield 'filter_choices',name,values
+        def append(target,name,key,value):
+            if name=='filter_choices':
+                choices=target.setdefault(name,{})
+                if isinstance(value,list):choices.setdefault(key,[]).extend(value)
+                elif key=='project_paths':
+                    paths=choices.setdefault(key,{})
+                    for project,items in value.items():paths.setdefault(project,[]).extend(items)
+                elif isinstance(value,dict):choices.setdefault(key,{}).update(value)
+                else:choices[key]=value
+            elif name=='models':
+                target.setdefault(name,[]).extend(value if value==[] else [value])
+            else:target[name].append(value)
+        def admitted(value):
+            size=retained_bytes(dict(kind='snapshot',value=value),store.limits.page_objects_bytes)
+            if size>store.limits.page_objects_bytes:
+                raise CapacityExceeded('one publication fragment exceeds the delivered-page budget')
+            return size
+
         first=True
         current=packet(message['sequence'],True)
-        size=_weight(current,sys.maxsize);count=0
+        size=retained_bytes(dict(kind='snapshot',value=current),sys.maxsize);count=0
         for name,key,value in parts():
-            weight=_weight((name,key,value),sys.maxsize)
-            if ((count and (count>=store.limits.page_rows or size+weight>store.limits.page_objects_bytes))
-                    or not count and first and size>store.limits.page_objects_bytes):
+            part={name:{key:value}} if name=='filter_choices' else {name:[value]}
+            weight=_weight(part,sys.maxsize)
+            if count and (count>=store.limits.page_rows or size+weight>store.limits.page_objects_bytes):
+                admitted(current)
                 self.sequence=current['sequence']
                 yield current
                 first=False
                 current=packet(self.sequence+1,False)
-                size=_weight(current,sys.maxsize);count=0
-            if name=='filter_choices':
-                choices=current.setdefault(name,{})
-                if isinstance(value,list):choices.setdefault(key,[]).extend(value)
-                elif isinstance(value,dict):choices.setdefault(key,{}).update(value)
-                else:choices[key]=value
-            elif name=='models':
-                current.setdefault(name,[]).extend(value if value==[] else [value])
-            else:current[name].append(value)
-            size+=weight;count+=1
+                size=retained_bytes(dict(kind='snapshot',value=current),sys.maxsize);count=0
+            if not count:
+                candidate=packet(current['sequence'],first)
+                append(candidate,name,key,value)
+                actual=retained_bytes(dict(kind='snapshot',value=candidate),sys.maxsize)
+                if actual>store.limits.page_objects_bytes and first:
+                    admitted(current)
+                    self.sequence=current['sequence']
+                    yield current
+                    first=False
+                    candidate=packet(self.sequence+1,False)
+                    append(candidate,name,key,value)
+                size=admitted(candidate)
+                current=candidate
+            else:
+                append(current,name,key,value)
+                size+=weight
+            count+=1
         current['more']=False
+        admitted(current)
         self.sequence=current['sequence']
         yield current

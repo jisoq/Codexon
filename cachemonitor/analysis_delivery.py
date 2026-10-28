@@ -176,6 +176,9 @@ class SnapshotReceiver:
                     pending['filter_choices']={};pending['choices_started']=True
                 for name,items in value['filter_choices'].items():
                     if isinstance(items,list):pending['filter_choices'].setdefault(name,[]).extend(items)
+                    elif name=='project_paths':
+                        paths=pending['filter_choices'].setdefault(name,{})
+                        for project,values in items.items():paths.setdefault(project,[]).extend(values)
                     elif isinstance(items,dict):pending['filter_choices'].setdefault(name,{}).update(items)
                     else:pending['filter_choices'][name]=items
             if value.get('more'):return None

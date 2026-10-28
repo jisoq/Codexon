@@ -136,3 +136,52 @@ def test_publication_preserves_unselected_cache_incident_lifecycle(tmp_path, sel
         expected = '회복 확인' if resolution == 'recovered' else '기록 정정: 이상 판정 해제'
         assert record['resolution'] == expected
         assert len(notifications.records) == 1
+
+
+def test_scoped_publication_preserves_global_model_alert_corrections(tmp_path):
+    from cachemonitor.analysis_delivery import MODEL_KEYS
+    from cachemonitor.notifications import ConfirmedNotifications
+    from cachemonitor.prepared_delivery import PreparedPublisher
+
+    notifications = ConfirmedNotifications(wall_clock=lambda: 200)
+    notifications.model_since = notifications.model_floor = 100
+    publisher = PreparedPublisher(100)
+
+    with storage.PreparedStore(tmp_path/'model-alerts.sqlite') as store:
+        def commit(revision, confirmed):
+            stage = store.begin(('source', revision))
+            for ordinal, sid in enumerate(('b', 'internal')):
+                key = ('home', sid)
+                row = dict(key=f'{sid}-call', ts=101, model_observation_ts=101,
+                    model_alert_confirmed=confirmed, requested_model='asked', response_model='reported')
+                summary, sections = split_summary(dict(own=dict(home='home', id=sid, title=sid,
+                    cache_misses=dict(count=0, events=[]), cache_health=dict(incident=None))))
+                stage.owner(*key, dict(home='home', id=sid, title=sid, _internal_review=sid=='internal'),
+                    dict(dict.fromkeys(storage.DEPENDENCIES, revision), source_digest=f'{revision:064x}'),
+                    source_ordinal=ordinal, summary=summary, choices={},
+                    model_alerts={row['key']:tuple(row.get(name) for name in MODEL_KEYS)} if confirmed else {})
+                stage.calls(key, [row], reconcile=True)
+                stage.sections(key, sections, reconcile=True)
+            stage.publish(('source', revision), ready=True)
+
+        commit(1, False)
+        publisher.adopt(store, [('home', 'b'), ('home', 'internal')], selected=[])
+        assert publisher.publish(dict(homes=['home']), store)['model_candidates'] == []
+
+        commit(2, True)
+        publisher.adopt(store, [('home', 'b'), ('home', 'internal')], selected=[])
+        current = publisher.publish(dict(homes=['home']), store)
+        visible = notifications.model_candidates(current['model_candidates'])
+        assert [(row['home'], row['sid']) for row in visible] == [('home', 'b')]
+        record = visible[0]
+        publisher.reset()
+        replay = publisher.publish(dict(homes=['home']), store)
+        assert [(row['home'], row['sid']) for row in replay['model_candidates']] == [('home', 'b')]
+        assert notifications.model_candidates(replay['model_candidates']) == []
+
+        commit(3, False)
+        publisher.adopt(store, [('home', 'b'), ('home', 'internal')], selected=[])
+        final = publisher.publish(dict(homes=['home']), store)
+        assert notifications.model_candidates(final['model_candidates']) == []
+        assert record['resolution'] == '관측 정정: 해당 응답의 확정 조건 해제'
+        assert len(notifications.records) == 1

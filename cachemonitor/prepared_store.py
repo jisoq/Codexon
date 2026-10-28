@@ -2576,6 +2576,24 @@ class Snapshot:
             lambda r: sum(len(r[name]) for name in fields))
 
     @_read_operation
+    def publication_heads(self, *, after=None):
+        args = dict(after=after or 0, n=self.limits.page_rows+1)
+        metadata = ("json_array('d',json((SELECT json_group_array(json(field.value)) "
+            "FROM json_each(v.metadata,'$[1]') field "
+            "WHERE json_extract(field.value,'$[0][1]') IN ('title','_internal_review'))))")
+        sql = (f'SELECT o.id,o.home,o.sid,{metadata} AS metadata,v.model_alerts '
+            'FROM owners o JOIN owner_heads h ON h.owner=o.id '
+            'JOIN owner_versions v ON v.owner=h.owner AND v.batch=h.batch '
+            'WHERE v.deleted=0 AND o.id>:after ORDER BY o.id LIMIT :n')
+        return self._page(sql,args,
+            lambda row: dict(owner=(row['home'],row['sid']),
+                metadata=unpack(row['metadata'].encode('utf-8'),self.limits),
+                model_alerts=unpack(row['model_alerts'],self.limits)),
+            lambda row:row['id'],
+            lambda row:len(row['metadata'].encode('utf-8'))+len(row['model_alerts'])+
+                4*(len(row['home'])+len(row['sid'])))
+
+    @_read_operation
     def ordering(self, *, after=None, home=None, sid=None):
         args = dict(ordinal=after[0] if after else 0, owner=after[1] if after else 0,
                     n=self.limits.page_rows+1)

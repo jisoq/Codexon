@@ -355,3 +355,16 @@ def test_receiver_extends_project_paths_and_discards_abandoned_nested_choices():
     assert final['filter_choices']['project_paths'] == {'project': ['C:/new-one', 'C:/new-two']}
     assert initial['filter_choices']['project_paths'] == {'project': ['C:/one', 'C:/two']}
     assert receiver.receive(frame(4, ['C:/late'])) is None
+
+
+def test_publisher_rejects_an_indivisible_metadata_fragment(tmp_path):
+    from dataclasses import replace
+    from cachemonitor import prepared_store as storage
+
+    limits = replace(storage.Limits(), page_objects_bytes=4096)
+    with storage.PreparedStore(tmp_path/'indivisible.sqlite', limits=limits) as store:
+        stage = store.begin(('source', 1))
+        stage.publish(('source', 1), ready=True)
+        publisher = PreparedPublisher(0)
+        with pytest.raises(storage.CapacityExceeded, match='publication fragment'):
+            list(publisher.publish_pages(dict(status='x'*8192), store))
