@@ -1566,8 +1566,8 @@ def test_activity_reorder_publishes_order_without_rewriting_analyzed_owners(tmp_
         assert updates[0]['changed'] == () and updates[0]['writes']['owners'] == 0
         assert store.db.execute('SELECT count(*) FROM owner_versions').fetchone()[0] == bodies
         assert store.token.generation == previous.generation+1
-        # Reject incomplete or over-budget order before changing the old
-        # publication/query token or any retained owner content.
+        # The publisher rejects incomplete or over-budget order before
+        # changing its publication token or retained owner content.
         publisher_owners=publisher.owners
         engine_sessions=engine.sessions
         original_order=storage.Snapshot.ordering
@@ -1577,16 +1577,18 @@ def test_activity_reorder_publishes_order_without_rewriting_analyzed_owners(tmp_
                 return replace(page,rows=tuple(row for row in page.rows if row['owner']!=owners[0]))
             invalid.setattr(storage.Snapshot,'ordering',incomplete)
             with pytest.raises(storage.NotReady):publisher.adopt(store,())
-            with pytest.raises(storage.NotReady):engine.adopt(store.token,())
+            engine.adopt(store.token,())
         assert publisher.token==previous and publisher.owners is publisher_owners
-        assert engine.token==previous and engine.sessions is engine_sessions
+        assert engine.token==store.token and engine.sessions is engine_sessions
         with monkeypatch.context() as capacity:
             capacity.setattr(publisher,'STATE_BYTES',1)
             capacity.setattr(engine,'OWNER_BYTES',1)
             with pytest.raises(storage.CapacityExceeded):publisher.adopt(store,())
-            with pytest.raises(storage.CapacityExceeded):engine.adopt(store.token,())
+            engine.adopt(store.token,())
+            assert list(engine.sessions)==list(reversed(owners))
+            assert [engine.sessions[owner]['owner_ordinal'] for owner in owners]==[2,1,0]
         assert publisher.token==previous and publisher.owners is publisher_owners
-        assert engine.token==previous and engine.sessions is engine_sessions
+        assert engine.token==store.token and engine.sessions is engine_sessions
         with monkeypatch.context() as order_only:
             def forbidden(*args, **kwargs):
                 raise AssertionError('order adoption must not read owner content or derived packets')
