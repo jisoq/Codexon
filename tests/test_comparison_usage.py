@@ -677,9 +677,6 @@ def test_owner_cache_overflow_falls_back_with_exact_cold_warm_append_and_correct
                     +sum(256+comparison._size(key)+comparison._size(label)+value.clone_bytes()
                          for key,(label,value) in entry['groups'].items())
                     for owner,entry in reference._comparison_cache['entries'].items())
-    # Cached folding borrows all owner observations. Charge a complete global
-    # population and two owner clones alongside fold scratch and delivery.
-    # These object estimates do not measure process RSS.
     allowance=(global_budget.peak+2*owner_bytes
                +reference.read_metrics['comparison_working_peak_bytes']
                +reference.read_metrics['comparison_result_bytes'])
