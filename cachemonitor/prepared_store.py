@@ -254,7 +254,7 @@ class CatalogWork(dict):
         statements = (
             'CREATE TEMP TABLE IF NOT EXISTS catalog_work(id INTEGER PRIMARY KEY AUTOINCREMENT)',
             'CREATE TEMP TABLE IF NOT EXISTS catalog_work_sessions(work INTEGER,ordinal INTEGER,home TEXT,sid TEXT,'
-                'parent TEXT,parent_sid TEXT,required INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(work,home,sid),UNIQUE(work,ordinal))',
+                'parent_sid TEXT,required INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(work,home,sid),UNIQUE(work,ordinal))',
             'CREATE INDEX IF NOT EXISTS temp.catalog_work_children ON catalog_work_sessions(work,home,parent_sid)',
             'CREATE INDEX IF NOT EXISTS temp.catalog_work_sid ON catalog_work_sessions(work,sid,home)',
             'CREATE TEMP TABLE IF NOT EXISTS catalog_work_members(work INTEGER,ordinal INTEGER,home TEXT,sid TEXT,'
@@ -296,8 +296,8 @@ class CatalogWork(dict):
             try:
                 if table=='sessions':
                     parent = row[2]
-                    self.db.execute('INSERT INTO catalog_work_sessions(work,ordinal,home,sid,parent,parent_sid) '
-                        'VALUES(?,?,?,?,?,?)', (self.work,ordinal,home,sid,json.dumps(parent),parent if type(parent) is str else None))
+                    self.db.execute('INSERT INTO catalog_work_sessions(work,ordinal,home,sid,parent_sid) '
+                        'VALUES(?,?,?,?,?)', (self.work,ordinal,home,sid,parent if type(parent) is str else None))
                 else:
                     self.db.execute('INSERT INTO catalog_work_members VALUES(?,?,?,?)', (self.work,ordinal,home,sid))
             except sqlite3.IntegrityError as error:
@@ -343,10 +343,6 @@ class CatalogWork(dict):
             entry = json.loads(row['entry'])
             lineage = entry['owner_lineage']
             parent = lineage.get('parent_thread_id')
-            existing = self.db.execute('SELECT parent FROM catalog_work_sessions '
-                'WHERE work=? AND home=? AND sid=?', (self.work,row['home'],row['sid'])).fetchone()
-            if existing is not None and 'parent_thread_id' in lineage and json.loads(existing[0]) != parent:
-                raise ValueError('owner lineage contradicts complete source membership')
             self.db.execute('INSERT INTO catalog_work_nodes(work,home,sid,parent_sid) VALUES(?,?,?,?) '
                 'ON CONFLICT(work,home,sid) DO UPDATE SET parent_sid=excluded.parent_sid',
                 (self.work,row['home'],row['sid'],parent if type(parent) is str else None))
