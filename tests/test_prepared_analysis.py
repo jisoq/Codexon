@@ -2290,3 +2290,53 @@ def test_incomplete_catalog_exposes_status_without_partial_membership(tmp_path):
         assert store.token == previous
         with store.read_current() as view:
             assert view.record(*OWNER, 'call-0')['cost'] == 1.
+
+
+def test_pinned_page_continuation_renews_vm_slices_without_changing_generation(tmp_path):
+    from cachemonitor.prepared_ingest import pages
+
+    owners = [('home', f'owner-{number:03d}') for number in range(80)]
+    dependency = dict.fromkeys(storage.DEPENDENCIES, 1)
+    dependency['source_digest'] = '1'*64
+    with storage.PreparedStore(tmp_path/'page-vm-slices.sqlite') as store:
+        stage = store.begin(('source', 1))
+        for ordinal, owner in enumerate(owners):
+            stage.owner(*owner, dict(home=owner[0], id=owner[1], title='Original'),
+                        dependency, source_ordinal=ordinal)
+        token = stage.publish(('source', 1), ready=True)
+        limits = replace(store.limits, page_rows=2, read_vm_steps=20_000, read_seconds=10)
+        with storage.PreparedReader(store.path, limits) as reader, reader.pin(token) as view:
+            rows = pages(view.catalog)
+            first = next(rows)
+            stage = store.begin(('source', 2))
+            stage.owner(*owners[0], dict(home=owners[0][0], id=owners[0][1], title='Updated'), dependency)
+            updated = stage.publish(('source', 2), ready=True)
+            actual = [first, *rows]
+            assert [row['owner'] for row in actual] == owners
+            assert all(row['metadata']['title']=='Original' for row in actual)
+            assert view.token == token
+        with store.read_current() as current:
+            assert current.token == updated
+            assert current.owner(*owners[0])['metadata']['title'] == 'Updated'
+        with storage.PreparedReader(store.path, replace(limits, read_vm_steps=1)) as reader:
+            with reader.pin(updated) as view:
+                with pytest.raises(storage.ReadCancelled):
+                    list(pages(view.catalog))
+                assert view.closed
+
+
+def test_pinned_page_continuation_renews_time_only_between_pages(tmp_path, monkeypatch):
+    from cachemonitor.prepared_ingest import pages
+
+    with storage.PreparedStore(tmp_path/'page-time-slices.sqlite') as store:
+        token = publish(store, 1, calls())
+        limits = replace(store.limits, page_rows=1, read_seconds=1)
+        clock = [100.]
+        with monkeypatch.context() as patch:
+            patch.setattr(storage.time, 'monotonic', lambda: clock[0])
+            with storage.PreparedReader(store.path, limits) as reader, reader.pin(token) as view:
+                rows = pages(view.calls, OWNER)
+                first = next(rows)
+                clock[0] += 2
+                assert [first['key'], *(row['key'] for row in rows)] == ['call-0', 'call-1', 'call-2']
+                assert view.token == token
