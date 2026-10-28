@@ -1472,3 +1472,143 @@ def test_lineage_catalog_preserves_parent_policy_without_full_metadata_scans(tmp
                     key:entry['owner_lineage'] for key,entry in catalog['owners'].items()}
         assert reader.channel.identity is None and not reader.channel.session_cache
     finally:reader.close();writer.close()
+
+
+def membership_snapshot(channel, count=24, width=300):
+    value=snapshot(channel)
+    home=channel.homes[0]
+    ids=[f'owner-{n}-'+('x'*width) for n in range(count)]
+    value.update(catalog_complete=True,demand=dict(selected=[[None,ids[0]]],aggregate=False,evidence=[]),
+        session_catalog=[[home,sid,ids[n-1] if n else None] for n,sid in enumerate(ids)],
+        demand_members=[[home,sid] for sid in ids])
+    value['sessions'][0]['id']=ids[0]
+    return value
+
+
+def test_catalog_pages_preserve_source_membership_before_loaded_owners(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection
+    monkeypatch.setattr(collection,'CATALOG_PAGE_ROWS',3)
+    monkeypatch.setattr(collection,'CATALOG_PAGE_BYTES',12*1024)
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=membership_snapshot(writer)
+        writer.publish(value,'epoch',1)
+        pages=[];cursor=None
+        while True:
+            page=reader.read_catalog(source='live',cursor=cursor,include_metadata=True)
+            pages.append(page)
+            assert page['catalog_identity']==('epoch',1) and page['membership_complete']
+            assert 'session_catalog' not in page['header'] and 'demand_members' not in page['header']
+            assert len(page['membership']['session_catalog'])+len(page['membership']['demand_members'])+len(page['owners'])<=3
+            cursor=page['cursor']
+            if cursor is None:break
+            assert len(pages)<100
+            assert cursor['membership_format']=='paged-v1'
+        assert [row for page in pages for row in page['membership']['session_catalog']]==value['session_catalog']
+        assert [row for page in pages for row in page['membership']['demand_members']]==value['demand_members']
+        owners={key:entry for page in pages for key,entry in page['owners'].items()}
+        key=(writer.homes[0],value['sessions'][0]['id'])
+        assert list(owners)==[key]
+        assert reader.read_owners([key],catalog=pages[-1])['sessions']==value['sessions']
+    finally:reader.close();writer.close()
+
+
+@pytest.mark.parametrize('live',[False,True])
+@pytest.mark.parametrize('passive',[False,True])
+def test_status_projection_preserves_full_catalog_and_body_readers(tmp_path,monkeypatch,live,passive):
+    from cachemonitor import usage_collection as collection
+    monkeypatch.setattr(collection,'CATALOG_PAGE_BYTES',4096)
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    if live:writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    status=collection.CollectionHeaderReader(writer.homes,writer.path) if passive else reader
+    try:
+        value=membership_snapshot(writer)
+        writer.publish(value,'epoch',1)
+        header=status.read_header()
+        assert header['ts']==value['ts'] and header['index']==value['index']
+        assert header['usage_collection_complete'] and header['catalog_complete']
+        assert not {'sessions','session_manifest','session_catalog','demand_members'}&header.keys()
+        assert reader.read(shared=True)==value
+        catalog=reader.read_catalog()
+        assert catalog['header']['session_catalog']==value['session_catalog']
+        assert catalog['header']['demand_members']==value['demand_members']
+        assert reader.read(shared=True)==value
+        row=writer.db.execute('SELECT * FROM snapshot WHERE id=1').fetchone()
+        assert len(row)==6
+        import zlib
+        durable=json.loads(zlib.decompress(row[5]))
+        assert durable['session_catalog']==value['session_catalog']
+        assert durable['demand_members']==value['demand_members']
+        if live:
+            for protocol in (3,4,5):
+                metadata,body=writer.live.request(dict(path=str(writer.path),scope=writer.scope,protocol=protocol,activity_stream=True))
+                assert metadata['ready'] and metadata['header']['session_catalog']==value['session_catalog']
+                assert metadata['header']['demand_members']==value['demand_members'] and body
+    finally:
+        if passive:status.close()
+        reader.close();writer.close()
+
+
+def test_optional_analysis_proof_capacity_keeps_canonical_title_and_facts(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=snapshot(writer)
+        value['sessions'][0]['title']='title-'+('x'*5000)
+        writer.publish(value,'epoch',1)
+        assert reader.read(shared=True)==value
+        catalog=reader.read_catalog(source='live',include_metadata=True,metadata_kind='lineage')
+        key=(writer.homes[0],'session')
+        assert reader.read_owners([key],catalog=catalog)['sessions']==value['sessions']
+        stream=reader.selected_owner_stream(key,catalog=catalog)
+        with stream:records=list(stream.records())
+        assert stream.verified
+        assert [row[4] for row in records if row[0]=='history' and row[1]=='item']==value['sessions'][0]['history']
+    finally:reader.close();writer.close()
+
+
+def test_append_availability_does_not_depend_on_source_membership_size(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    try:
+        value=membership_snapshot(writer,count=900)
+        writer.publish(value,'epoch',1)
+        metadata,body=writer.live.request(dict(path=str(writer.path),scope=writer.scope,protocol=6,read='append',
+            homes=writer.homes,catalog_identity=('epoch',1),owner=[writer.homes[0],value['sessions'][0]['id']],
+            prior_body_digest='0'*64))
+        assert not metadata['ready'] and metadata['error']=='append_unavailable' and not body
+    finally:writer.close()
+
+
+@pytest.mark.extended
+def test_real_default_membership_growth_exceeds_old_full_header_limits(tmp_path):
+    from cachemonitor import usage_collection as collection
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    status=collection.CollectionHeaderReader(writer.homes,writer.path)
+    try:
+        value=membership_snapshot(writer,count=2496,width=1800)
+        assert len(json.dumps({key:item for key,item in value.items() if key!='sessions'}).encode())>8*1024*1024
+        writer.publish(value,'epoch',1)
+        session_rows=[];demand_rows=[];owners={};cursor=None
+        while True:
+            page=reader.read_catalog(source='live',cursor=cursor)
+            assert page['membership_complete'] and page['catalog_identity']==('epoch',1)
+            session_rows.extend(page['membership']['session_catalog'])
+            demand_rows.extend(page['membership']['demand_members'])
+            owners.update(page['owners']);cursor=page['cursor']
+            if cursor is None:break
+        assert session_rows==value['session_catalog'] and demand_rows==value['demand_members']
+        assert list(owners)==[(writer.homes[0],value['sessions'][0]['id'])]
+        assert status.read_header()['index']==value['index']
+        assert reader.read_header()['ts']==value['ts']
+        status.close();reader.close()
+        writer.live_server.close();writer.live_server=None
+        writer.live.close();writer.live=None
+        reader=CollectionChannel(writer.homes,writer.path)
+        status=collection.CollectionHeaderReader(writer.homes,writer.path)
+        assert status.read_header()['usage_collection_complete']
+        assert reader.read_header()['catalog_complete']
+        assert reader.read(shared=True)==value
+    finally:status.close();reader.close();writer.close()
