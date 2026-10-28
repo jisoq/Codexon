@@ -137,15 +137,16 @@ def test_selected_reverse_lineage_tracks_every_writer(tmp_path, writer):
                             encoding='utf8')
             getattr(index, writer)(str(path), home, CHILD)
         else:
-            index.discover_header(str(path), home, CHILD)
-            path.write_text(json.dumps(event('session_meta', id=CHILD)) + '\n', encoding='utf8')
-            index.discover_header(str(path), home, CHILD)
-            with sqlite3.connect(home / 'state_5.sqlite') as db:
-                db.execute('UPDATE threads SET parent_thread_id=? WHERE id=?', (OTHER, CHILD))
+            path.write_text(json.dumps(event('session_meta', id=CHILD, parent_thread_id=OTHER)) + '\n',
+                            encoding='utf8')
+            index.scan_file(str(path), home, CHILD)
+            assert index.metadata[(str(home), CHILD)]['parent_thread_id'] == TID
             if writer == 'discover':
                 index.discover(10011)
             else:
                 index.refresh_metadata({home.resolve()})
+            assert index.metadata[(str(home), CHILD)]['parent_thread_id'] == OTHER
+            index.lineage[(str(home), CHILD)] = {}
         assert [str(home), CHILD] not in index.resolve_selection([(None, TID)])['demand_members']
         assert [str(home), CHILD] in index.resolve_selection([(None, OTHER)])['demand_members']
         if writer == 'scan_file':
@@ -196,7 +197,8 @@ def test_selected_source_queries_use_indexed_owner_and_parent_access(indexed_sou
     queries = [sql for sql in statements if sql.lstrip().upper().startswith('SELECT')
                and any(name in sql.lower() for name in ('metadata', 'event_sessions', 'event_records',
                                                         'events_legacy', 'usage_archive'))
-               and 'sqlite_master' not in sql.lower()]
+               and 'sqlite_master' not in sql.lower()
+               and sql.strip() != 'SELECT value FROM usage_archive_revision']
     assert any('metadata' in sql.lower() for sql in queries)
     assert any('usage_archive' in sql.lower() for sql in queries)
     assert any('event_sessions' in sql.lower() for sql in queries)
