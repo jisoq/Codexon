@@ -310,6 +310,48 @@ def test_cancelled_selected_cohort_can_switch_through_aggregate(tmp_path,source_
 
 
 
+def test_selected_outside_ledger_correction_survives_restart_without_inventory(tmp_path,monkeypatch,source_reader):
+    from contextlib import closing
+    from cachemonitor.prepared_ledger import PreparedLedger
+    from cachemonitor.quota_cycles import QuotaLedger
+    from cachemonitor import quota_prepared_sync as progress
+    from test_prepared_ledger_reuse import _envelope
+
+    sources=source_reader
+    sources.update(a=source('a',response='shared'),z=source('z',response='shared'))
+    prepared_path=tmp_path/'prepared.sqlite';quota_path=tmp_path/'quota.sqlite'
+    with storage.PreparedStore(prepared_path) as store,closing(QuotaLedger(quota_path)) as ledger:
+        list(ingest.PreparedCohort(store,None,None).convert(catalog(sources)))
+        list(PreparedLedger(ledger,store).sync(_envelope()))
+        assert [tuple(row) for row in ledger.db.execute('SELECT uid,sid FROM calls')]==[('shared','a')]
+        sources['a']=source('a',response='new')
+        selected=catalog(sources,2,family=('a',),evidence=('z',))
+        updates=list(ingest.PreparedCohort(store,None,None).convert(selected))
+        assert set(updates[-1]['changed'])=={('home','a'),('home','z')}
+        with store.read_current() as view:
+            expected={owner:progress.source_stamp(view.owner(*owner)['dependencies'])
+                      for owner in (('home','a'),('home','z'))}
+            assert view.record('home','z','shared') is not None
+
+    with storage.PreparedStore(prepared_path) as store,closing(QuotaLedger(quota_path)) as ledger:
+        revisions=storage.Snapshot.owner_revisions
+        inventory=storage.Snapshot.inventory
+        def bounded_revisions(view,owners=None,**kwargs):
+            assert owners is not None and set(owners)<={('home','a'),('home','z')}
+            return revisions(view,owners,**kwargs)
+        def bounded_inventory(view,*,owners=None,**kwargs):
+            assert owners is not None and set(owners)<={('home','a'),('home','z')}
+            return inventory(view,owners=owners,**kwargs)
+        monkeypatch.setattr(storage.Snapshot,'owner_revisions',bounded_revisions)
+        monkeypatch.setattr(storage.Snapshot,'inventory',bounded_inventory)
+        monkeypatch.setattr(storage.Snapshot,'inventory_scan',forbidden_population)
+        updates=list(ingest.PreparedCohort(store,None,None).convert(selected))
+        assert all(not update['changed'] for update in updates)
+        list(PreparedLedger(ledger,store).sync(dict(_envelope(201),collection_partial=True),owners=(('home','a'),)))
+        assert [tuple(row) for row in ledger.db.execute('SELECT uid,sid FROM calls ORDER BY uid')]==[('new','a'),('shared','z')]
+        assert progress.applied(ledger.db,expected)==expected
+
+
 @pytest.mark.parametrize('previous_family',[None,('a','unrelated')])
 def test_warning_selection_switch_does_not_compare_the_retained_global_population(tmp_path,source_reader,previous_family):
     from threading import Condition,Event
