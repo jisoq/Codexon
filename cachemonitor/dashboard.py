@@ -329,6 +329,8 @@ class Dashboard(TrayWindow):
         if not hasattr(self,'quota_panel'):return
         visible=self.isVisible() and not self.isMinimized()
         page=getattr(self,'current_page',3)
+        if self.worker is not None and hasattr(self.worker,'cancel_queries') and (not visible or page in (3,4,7)):
+            self.worker.cancel_queries()
         self.quota_panel.set_presentation_active(visible and page==3)
         for service in getattr(self,'quota_services',{}).values():
             service.set_reports_enabled(visible and page==3 and service is self.quota_service)
@@ -585,7 +587,7 @@ class Dashboard(TrayWindow):
 
     def render(self,*_,automatic=False):
         if self.restoring or not hasattr(self,'settings_page'):return
-        if automatic and (not self.isVisible() or self.isMinimized()):
+        if self.async_mode and (not self.isVisible() or self.isMinimized()):
             self._display_dirty=True;return
         if self.current_page==7:
             self.mismatch_page.refresh(automatic=automatic)
@@ -745,6 +747,9 @@ class Dashboard(TrayWindow):
     @batched_updates
     def analysis_progressed(self,message):
         if isinstance(message,(PreparationStage,PreparationWork)):
+            overlay=getattr(self,'overlay',None)
+            if overlay is not None and overlay.preparation is not None:
+                overlay.receive_preparation(replace(overlay.preparation,progress=message))
             if self.preparation is not None:
                 self.preparation=replace(self.preparation,progress=message)
                 self.sync_preparation()
@@ -841,7 +846,6 @@ class Dashboard(TrayWindow):
         pending=self.preparation
         overlay=getattr(self,'overlay',None)
         if pending is None:
-            if overlay:overlay.receive_preparation(None)
             return
         from .app_errors import collection_phase
         phase=collection_phase({**self.snapshot,**self.home_collection_status},time.time(),started_at=self.started_at)

@@ -189,7 +189,6 @@ class UsageIndex:
             self.db.commit()
         try:
             self.event_store=EventStore(self.db,self.path)
-            self.event_store.migrate(time.monotonic()+.025)
             self._initialize_runtime(model_evidence_path,custom_index=path is not None)
         except BaseException:
             self.db.close();raise
@@ -211,9 +210,15 @@ class UsageIndex:
 
     def _initialize_runtime(self, model_evidence_path, *, custom_index, all_metadata=False):
         self.monitor = SessionRegistry()
+        self.demand=None
+        self.active_members=set()
+        self.active_sources=set()
+        self.selected_members=set()
+        self.catalog_complete=False
         self.replay = None
         selected_homes={str(h) for h in self.homes}
         self.metadata = {(r[0],r[1]):json.loads(r[2]) for r in self.db.execute('select home,tid,data from metadata') if all_metadata or r[0] in selected_homes}
+        self.catalog_owners=set(self.metadata)
         self.files = []
         self.queue = deque()
         self.prioritized_roots = set()
@@ -226,6 +231,7 @@ class UsageIndex:
         self.cached_restore=deque(self.event_store.owners(homes_key)) if homes_key else deque()
         self.bytes_read = 0
         self.errors = []
+        self.failed_sources=set()
         self.collection_fault = {}
         self.loaded = set()
         self.version = 0
@@ -322,7 +328,7 @@ class UsageIndex:
                             try:
                                 with Path(row['rollout_path']).open('rb') as source:
                                     header=json.loads(source.readline(2*1024*1024))
-                                if header.get('type')=='session_meta':
+                                if isinstance(header,dict) and header.get('type')=='session_meta':
                                     self.lineage[key]=session_lineage(header.get('payload'),row['id'])
                             except (OSError,ValueError,TypeError):
                                 pass
@@ -347,7 +353,17 @@ class UsageIndex:
                     resolved = str(path.resolve()).removeprefix('\\\\?\\')
                     if resolved not in paths:
                         # A filename is not proof of ownership; session_meta supplies the ID.
-                        paths[resolved] = (home, None)
+                        try:
+                            with path.open('rb') as source:header=json.loads(source.readline(2*1024*1024))
+                            payload=header.get('payload') if isinstance(header,dict) else None
+                            tid=payload.get('id') if isinstance(payload,dict) and header.get('type')=='session_meta' else None
+                            if not isinstance(tid,str):tid=None
+                        except (OSError,ValueError,TypeError):tid=None
+                        if tid:
+                            key=(str(home),tid)
+                            self.lineage[key]=session_lineage(payload,tid)
+                            self.metadata.setdefault(key,dict(id=tid,**self.lineage[key]))
+                        paths[resolved] = (home, tid)
         # Replacing the discovery queue also releases owners that can no longer run.
         self.source_work={path:state for path,state in self.source_work.items() if path in paths}
         self.source_hashes={path:value for path,value in self.source_hashes.items() if path in paths}
@@ -364,6 +380,52 @@ class UsageIndex:
             self.tier_backfill=False
         self.done_files = 0
         self.last_discovery = now
+        self.catalog_complete=not self.errors
+
+    def admit_demand(self):
+        known=set(self.metadata)|set(self.event_store.owners(tuple(str(home) for home in self.homes)))
+        known.update((str(home),tid) for _,home,tid in self.files if tid)
+        self.catalog_owners=known
+        if self.demand is None:
+            selected=set()
+            members=known
+            sources=known
+        else:
+            selected=set()
+            for home,sid in self.demand['selected']:
+                matches={key for key in known if key[1]==sid and (home is None or home==key[0])}
+                if len(matches)==1:selected.update(matches)
+            while True:
+                children={key for key in known if (key[0],(self.lineage.get(key) or self.metadata.get(key,{})).get('parent_thread_id')) in selected}
+                if children<=selected:break
+                selected.update(children)
+            members=set(known) if self.demand['aggregate'] else set(selected)
+            sources=members|{tuple(key) for key in self.demand['evidence'] if tuple(key) in known}
+        removed=self.active_sources-sources
+        for key in removed:
+            job=self.rebuild_jobs.pop(key,None)
+            if job is not None:job.close()
+            self.monitor.sessions.pop(key,None)
+            self.loaded.discard(key)
+            self.new_events.pop(key,None)
+            self.rebuild_required.discard(key)
+            self.append_origins.pop(key,None)
+        self.selected_members=selected
+        self.active_members,self.active_sources=members,sources
+        if self.replay is not None and not sources and self.demand is not None and not self.demand['aggregate']:
+            if self.replay.restore_job is not None:
+                self.replay.restore_job.close();self.replay.restore_job=None
+            self.replay.pending.clear()
+        if self.demand is not None:
+            self.queue=deque(args for args in self.queue if self.demand['aggregate'] or (str(args[1]),args[2]) in sources)
+            self.pending_rebuilds=deque(key for key in self.pending_rebuilds if key in sources)
+            self.cached_restore=deque(dict.fromkeys([key for key in self.cached_restore if key in sources]+
+                [key for key in sources if key not in self.loaded]))
+            self.cached_restore=deque(sorted(self.cached_restore,key=lambda key:key not in selected))
+            self.pending_rebuilds=deque(sorted(self.pending_rebuilds,key=lambda key:key not in selected))
+            queued={args[0] for args in self.queue}
+            self.queue.extend(args for args in self.files if (self.demand['aggregate'] or (str(args[1]),args[2]) in sources)
+                              and (str(args[1]),args[2]) not in self.loaded and args[0] not in queued)
 
     def validate_cached_prefix(self, source, offset, path, home, tid, state, budget):
         """Check one prefix slice; None means more validation remains."""
@@ -544,6 +606,7 @@ class UsageIndex:
                             (path, pos, str(home), tid, stamp(clean['timestamp']), pack_event(encoded)))
                         self.observe_quota(home,clean['payload'].get('rate_limits'),stamp(clean['timestamp']))
                 except (ValueError, TypeError, AttributeError):
+                    self.failed_sources.add((str(home),tid))
                     self.errors.append(f'일부 기록 형식 확인 필요: {str(tid or p.name)[:8]}')
                     self.collection_fault['read_failed']=True
             offset = f.tell()
@@ -583,7 +646,7 @@ class UsageIndex:
         return (str(home), tid) if tid else None
 
     def _source_ready(self,key):
-        return (not self.initial and not self.cached_restore and key in self.loaded
+        return (key in self.loaded and key not in self.cached_restore
                 and key not in self.pending_rebuilds and key not in self.rebuild_jobs
                 and key not in self.rebuild_required and not self.new_events.get(key)
                 and not (self.replay and key in self.replay.pending))
@@ -760,15 +823,17 @@ class UsageIndex:
         if self.read_only:raise ValueError('읽기 전용 색인에서는 원본 수집을 실행할 수 없습니다')
         now = now or time.time()
         self.errors = []
+        self.failed_sources=set()
         self.collection_fault = {}
+        self.admit_demand()
         if self.replay is not None:
-            self.model_evidence.poll()
+            self.model_evidence.poll(historical=self.demand is None or self.demand['aggregate'])
             self.replay.begin(now)
-        catalog=self.catalog_signature() if not self.queue else self.source_catalog
-        if not self.queue and (not self.files or now - self.last_discovery >= 10 or catalog!=self.source_catalog):
+        catalog=self.catalog_signature() if not self.queue or source_hint is not None and (source_hint.uncertain or source_hint.metadata) else self.source_catalog
+        if (not self.queue and (not self.files or now - self.last_discovery >= 10)) or catalog!=self.source_catalog:
             self.discover(now)
             self.source_catalog=catalog
-            if not self.quota_seeded:
+            if not self.quota_seeded and self.demand is None:
                 self.seed_quota()
                 self.quota_seeded=True
         else:
@@ -780,6 +845,7 @@ class UsageIndex:
                 self.queue = deque(self.files)
                 self.prioritized_roots.clear()
                 self.done_files = 0
+        self.admit_demand()
         if source_hint is not None and source_hint.roots:
             # A notification identifies a watched tree, not a filename. Include
             # its files once per authoritative pass. Repeated wakes must not
@@ -787,10 +853,12 @@ class UsageIndex:
             roots=source_hint.roots-self.prioritized_roots
             self.prioritized_roots.update(roots)
             if roots:
-                priority=[args for args in self.files
+                priority=[args for args in self.files if self.demand is None or (str(args[1]),args[2]) in self.active_sources
                           if any(Path(args[0]).is_relative_to(root) for root in roots)]
                 paths={args[0] for args in priority}
                 self.queue=deque(priority+[args for args in self.queue if args[0] not in paths])
+        if self.demand is not None:
+            self.queue=deque(sorted(self.queue,key=lambda args:(str(args[1]),args[2]) not in self.selected_members))
         changed = set()
         self.prefix_priority = PREFIX_PRIORITY_BUDGET
         deadline = time.monotonic() + .4
@@ -813,6 +881,7 @@ class UsageIndex:
                     if self.replay is not None:self.replay.pending.discard(key)
                     changed.add(key)
             except (OSError, sqlite3.Error) as exc:
+                self.failed_sources.add((str(args[1]),args[2]))
                 self.source_work.pop(args[0],None)
                 self.verified_sources.pop(args[0],None)
                 self.errors.append(f'기록 읽기: {Path(args[0]).name}: {exc}')
@@ -834,10 +903,13 @@ class UsageIndex:
             self.initial = False
             self.restore_cached(now,deadline)
         if not self.rebuild_jobs and time.monotonic()<deadline:
-            self.event_store.migrate(deadline)
+            self.event_store.migrate(deadline,owners=self.active_sources if self.demand is not None and not self.demand['aggregate'] else None)
         usage_errors=list(self.errors)
         usage_complete=not self.queue and not self.cached_restore and not self.pending_rebuilds and not self.rebuild_jobs and not usage_errors
         if self.replay is not None and self.replay.restore_job is not None:usage_complete=False
+        if self.demand is not None and self.demand['aggregate']:
+            self.active_members.update(self.monitor.sessions)
+            self.active_sources.update(self.monitor.sessions)
         self.rebuild_deadline=None
         return self.snapshot(now,changed,usage_complete,usage_errors)
 
@@ -851,14 +923,14 @@ class UsageIndex:
             self.cached_restore.popleft()
 
     def ready_sessions(self,usage_complete):
-        # A queued source can still establish new ancestry. Once every source
-        # is checked, unrelated retained owners need not hold ready sessions.
-        if self.queue or self.errors or self.model_evidence.catching_up:return set()
+        if (self.model_evidence.error or self.model_evidence.catching_up and self.demand is None
+                or self.errors and (self.demand is None or not self.catalog_complete)):return set()
         if usage_complete:
             return {key for key,s in self.monitor.sessions.items() if not s.pending}
-        pending=({key for key in self.cached_restore if key not in self.loaded}
+        pending=(self.failed_sources|{key for key in self.cached_restore if key not in self.loaded}
                  |set(self.pending_rebuilds)|set(self.rebuild_jobs)|set(self.rebuild_required)
                  |{key for key,events in self.new_events.items() if events})
+        pending.update((str(home),tid) for _,home,tid in self.queue)
         blocked=set(pending);unknown_homes=set()
         for key in pending:
             seen=set()
@@ -868,11 +940,12 @@ class UsageIndex:
                 session=self.monitor.sessions.get(key)
                 lineage=self.lineage.get(key)
                 if meta is None and session is None and lineage is None:
-                    unknown_homes.add(key[0]);break
+                    if self.demand is None:unknown_homes.add(key[0])
+                    break
                 parent=(lineage or {}).get('parent_thread_id') or (meta or {}).get('parent_thread_id')
                 if not parent and session is not None:parent=session.parent_thread_id
                 if not parent:
-                    if (meta or {}).get('thread_source')=='subagent':unknown_homes.add(key[0])
+                    if self.demand is None and (meta or {}).get('thread_source')=='subagent':unknown_homes.add(key[0])
                     break
                 key=(key[0],parent);blocked.add(key)
         return {key for key,s in self.monitor.sessions.items()
@@ -882,12 +955,14 @@ class UsageIndex:
         self.monitor.trim_unassigned(now)
         for home in self.homes:
             try:
-                self.monitor.read_logs(home, now)
+                self.monitor.read_logs(home, now,owners=self.active_sources if self.demand is not None and not self.demand['aggregate'] else None)
             except (OSError, sqlite3.Error) as exc:
                 self.errors.append(f'{home.name} / 연결 기록: {exc}')
                 self.collection_fault['read_failed']=True
-        if self.replay is None:self.model_evidence.poll()
-        if self.model_evidence.catching_up:usage_complete=False
+        if self.replay is None:
+            self.model_evidence.poll(historical=self.demand is None or self.demand['aggregate'])
+        evidence_pending=self.model_evidence.catching_up and (self.demand is None or self.demand['aggregate'])
+        if evidence_pending:usage_complete=False
         if self.model_evidence.error:
             self.errors.append(self.model_evidence.error)
         ready=self.ready_sessions(usage_complete)
@@ -896,6 +971,7 @@ class UsageIndex:
         # The next publication resolves again so changed links are still observed.
         evidence_homes = {home:home_key(home) for home in dict.fromkeys(home for home,_ in self.monitor.sessions)}
         for key, s in self.monitor.sessions.items():
+            if self.demand is not None and key not in self.active_sources:continue
             meta = self.metadata.get(key, {})
             if hasattr(s,'_replay_body'):
                 views.append(self.replay.view(key,s,key in ready,now))
@@ -904,7 +980,7 @@ class UsageIndex:
             s.trim(now)
             if s.excluded_title:
                 continue
-            if not s.requests and not s.reported_usage and not s.transports and not s.request_state:
+            if not s.requests and not s.reported_usage and not s.transports and not s.request_state and key not in self.selected_members:
                 continue
             view = dict(s.view(now,use_cache=True))
             view['history'] = self.model_evidence.enrich_owned(evidence_homes[s.home],view['history'],s,
@@ -949,7 +1025,8 @@ class UsageIndex:
         self.version += bool(changed)
         if self.pending_rebuilds:usage_complete=False
         if usage_complete:self.last_usage_success=now
-        if self.archive is not None:views.extend(self.archive.views(now,{str(h) for h in self.homes}))
+        if self.archive is not None:views.extend(self.archive.views(now,{str(h) for h in self.homes},
+            owners=None if self.demand is None or self.demand['aggregate'] else self.active_members))
         activity_revision = (self.model_evidence.generation,self.model_evidence.revision)
         if activity_revision != self.activity_publication:
             self.activity_rows = list(self.model_evidence.changed_activity.values())
@@ -964,6 +1041,12 @@ class UsageIndex:
                 'activity_source_limit':self.model_evidence.highwater,
                 'activity_source_offset':self.model_evidence.offset,
                 'usage_collection_complete':usage_complete,'last_usage_collection_success':self.last_usage_success,
+                'catalog_complete':self.catalog_complete,
+                'demand':self.demand,
+                'demand_members':[list(key) for key in sorted(self.active_members|{(view['home'],view['id']) for view in views if view.get('source')=='imported'})],
+                'session_catalog':[[home,sid,(self.lineage.get((home,sid)) or self.metadata.get((home,sid),{})).get('parent_thread_id')]
+                                   for home,sid in sorted(self.catalog_owners)]+
+                                  [[view['home'],view['id'],view.get('parent_thread_id')] for view in views if view.get('source')=='imported'],
                 'usage_errors':usage_errors,
                 'collection_fault':dict(self.collection_fault),
                 'observation_read_failed':bool(self.model_evidence.error),
@@ -972,10 +1055,10 @@ class UsageIndex:
                 'unassigned_dropped': self.monitor.unassigned_dropped,
                 'excluded_title_sessions': sum(s.excluded_title for s in self.monitor.sessions.values() if not hasattr(s,'_replay_body')),
                 'quota_by_home':dict(self.quota_by_home),
-                'index': {'loading': bool(self.queue or self.cached_restore or self.pending_rebuilds or self.rebuild_jobs or self.model_evidence.catching_up
-                                         or self.replay is not None and self.replay.restore_job is not None), 'done': min(self.done_files, len(self.files)),
+                'index': {'loading': bool(self.queue or self.cached_restore or self.pending_rebuilds or self.rebuild_jobs or evidence_pending
+                                         or self.replay is not None and self.replay.restore_job is not None), 'done': min(self.done_files, sum(self.demand is None or self.demand['aggregate'] or (str(home),tid) in self.active_sources for _,home,tid in self.files)),
                           'usage_complete':usage_complete,'last_usage_success':self.last_usage_success,
-                          'files': len(self.files), 'bytes_read': self.bytes_read, 'version': self.version,
+                          'files': sum(self.demand is None or self.demand['aggregate'] or (str(home),tid) in self.active_sources for _,home,tid in self.files), 'bytes_read': self.bytes_read, 'version': self.version,
                           'path': str(self.path)}}
         self.track_publication(snapshot)
         return snapshot

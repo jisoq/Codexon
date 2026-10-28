@@ -17,6 +17,7 @@ from .overlay_data import summarize_session
 from .prepared_store import UNCHANGED, CapacityExceeded, BatchCapacityExceeded, OWNER_FIELDS, FORBIDDEN_OWNER, RAW_TRANSPORT_FIELDS, pack
 from .pricing import Rate, pricing_signature
 from .request_modes import mode_parents, requires_parent_mode
+from .usage_collection import CollectionCatalogUnavailable
 
 
 PREPARATION = ('canonical-owner', 9)
@@ -116,6 +117,26 @@ def read_catalog(client, *, cancel=None, limits=IngestLimits()):
                 if weight > limits.catalog_bytes:
                     raise CapacityExceeded('recovered owner metadata exceeds the catalog budget')
                 entry['owner_lineage'] = metadata
+            demand=(getattr(client,'active_demand',None) or catalog['header']['demand']) if catalog['header'].get('demand') is not None else None
+            if demand is not None:
+                lineage={(home,sid):parent for home,sid,parent in catalog['header'].get('session_catalog',())}
+                selected=set()
+                for home,sid in demand['selected']:
+                    matches={key for key in lineage if key[1]==sid and (home is None or home==key[0])}
+                    if len(matches)==1:selected.update(matches)
+                required=set(selected)
+                while True:
+                    children={key for key,parent in lineage.items() if (key[0],parent) in required}
+                    if children<=required:break
+                    required.update(children)
+                catalog['selected_members']=required
+                members={tuple(key) for key in catalog['header'].get('demand_members',())} if demand['aggregate'] else required
+                catalog['mode_sources']={key:entry for key,entry in owners.items() if key not in members
+                                         and entry.get('state',{}).get('collection_complete')}
+                catalog['owners']={key:dict(entry,source_ordinal=ordinal) for ordinal,(key,entry) in enumerate(
+                    (item for item in owners.items() if item[0] in members and item[1].get('state',{}).get('collection_complete')))}
+                catalog['membership_complete']=required<=catalog['owners'].keys()
+                catalog['aggregate_complete']=bool(demand['aggregate'] and catalog['header'].get('usage_collection_complete'))
             return catalog
 
 
@@ -160,7 +181,7 @@ def read_source(client, key, catalog, *, cancel=None, limits=IngestLimits()):
                 raise CapacityExceeded('selected source preparation budget exceeded')
     if (source.get('home'), source.get('id')) != tuple(key):
         raise ValueError('selected source owner does not match the catalog')
-    entry = catalog['owners'][key]
+    entry = catalog['owners'].get(key) or catalog.get('mode_sources',{})[key]
     # Producer revisions do not prove persisted analytical reuse. The digest
     # does, and is also a valid in-process revision for this selected owner.
     source.update(entry.get('state', {}))
@@ -190,8 +211,9 @@ def _materialized_weight(source, limit, check):
 
 def mode_parent_index(catalog):
     """Apply the existing cycle policy to metadata before selecting ancestors."""
-    metadata = []
-    for owner, entry in catalog['owners'].items():
+    metadata = [dict(home=home,id=sid,parent_thread_id=parent)
+                for home,sid,parent in catalog.get('header',{}).get('session_catalog',())]
+    for owner, entry in {**catalog.get('mode_sources',{}),**catalog['owners']}.items():
         item = entry.get('owner_lineage', entry.get('owner_metadata'))
         if item is None:
             raise ValueError('owner lineage must be resolved before mode dependency selection')
@@ -210,10 +232,12 @@ def mode_context(key, catalog, *, parents=None, ancestry_required=True):
 
 
 def mode_dependency(context, catalog, ledger):
-    values = tuple((key, catalog['owners'][key].get('analysis_digest') or catalog['owners'][key]['body_digest'],
-                    ledger.mode_dependency(*key) if ledger is not None else None)
-                   for key in context)
-    return sha256(pack(('mode-lineage', 1, values))).hexdigest()
+    values=[]
+    for key in context:
+        entry=catalog['owners'].get(key) or catalog.get('mode_sources',{}).get(key,{})
+        values.append((key,entry.get('analysis_digest') or entry.get('body_digest'),
+                       ledger.mode_dependency(*key) if ledger is not None else None))
+    return sha256(pack(('mode-lineage', 1, tuple(values)))).hexdigest()
 
 
 def read_enriched_source(client, key, catalog, ledger, *, parents=None, cancel=None,
@@ -502,7 +526,11 @@ class PreparedCohort:
 
     def _load(self, owner, limits):
         self._check()
-        cache_key = (owner, self.catalog['owners'][owner]['body_digest'])
+        entry=self.catalog['owners'].get(owner) or self.catalog.get('mode_sources',{}).get(owner)
+        if entry is None:
+            self.client.request_mode_sources((owner,))
+            raise CollectionCatalogUnavailable('mode_source_pending')
+        cache_key = (owner, entry['body_digest'])
         old = self.cache.get(cache_key)
         if old is not None:
             if old[1] > limits.owner_source_bytes:
@@ -510,7 +538,7 @@ class PreparedCohort:
             self.cache.move_to_end(cache_key)
             # Captured volatile state belongs to this catalog, not the older
             # cached envelope sharing the same verified source body.
-            return dict(old[0], **self.catalog['owners'][owner].get('state', {})), old[1]
+            return dict(old[0], **entry.get('state', {})), old[1]
         source, weight = read_source(self.client, owner, self.catalog, cancel=self.cancel, limits=limits)
         self.metrics['source_reads'] += 1
         if weight <= self.SOURCE_CACHE_BYTES:
@@ -916,7 +944,7 @@ class PreparedCohort:
                 self.order_changed = True
             wanted = dependencies(entry['body_digest'],
                 mode_dependency(mode_context(owner,catalog,parents=parents,
-                    ancestry_required=old is None or old['dependencies'].get('mode_ancestry_required') is not False),
+                    ancestry_required=old is not None and old['dependencies'].get('mode_ancestry_required') is not False),
                     catalog,self.ledger),
                 old['dependencies'].get('ownership') if old else None,state=entry.get('state',{}),
                 models=old.get('models') if old else None)

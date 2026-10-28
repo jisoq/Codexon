@@ -54,9 +54,9 @@ GROUPS = {
                               'observer_panel', 'windows_startup', 'proxy_update', 'collection_observation') + (
         'tests/test_model_proxy.py::test_drain_preserves_work_accepted_after_the_last_idle_probe',),
     'graphics_recovery': test_files('graphics_recovery', 'window_recovery', 'quick_ui', 'overlay_shadow'),
-    'data': test_files('core', 'index', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport', 'collection_preparation'),
+    'data': test_files('core', 'index', 'demand_loading', 'data_contract', 'subagent_collection', 'request_tier_snapshots', 'collection_defaults', 'collection_crash_recovery', 'collection_transport', 'collection_preparation'),
     'analysis': test_files('comparison', 'comparison_usage', 'overview', 'performance', 'data_contract', 'output_speed'),
-    'prepared': test_files('prepared_analysis', 'prepared_format_migration', 'analysis_query_actor',
+    'prepared': test_files('prepared_analysis', 'prepared_format_migration', 'analysis_query_actor', 'demand_loading',
                          'prepared_revision_reads', 'prepared_retention_weights',
                          'prepared_restart_incremental', 'prepared_reader_lifecycle',
                          'prepared_notification_heads', 'prepared_mode_dependencies',

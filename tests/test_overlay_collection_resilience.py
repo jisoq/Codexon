@@ -297,9 +297,10 @@ def test_service_collects_large_record_once_for_gui_and_worker(tmp_path,monkeypa
         monkeypatch.setattr(UsageIndex,'scan_file',no_scan)
         for client in (gui,worker):
             snapshot=client.poll(10010)
-            transport={'activity_cursor','activity_highwater','activity_more'}
+            transport={'activity_cursor','activity_highwater','activity_more','activity_live_start'}
             assert {k:v for k,v in snapshot.items() if k not in transport}==json.loads(json.dumps(produced))
             assert snapshot['activity_cursor'][1]==snapshot['activity_highwater']==0
+            assert snapshot['activity_live_start']==0
             assert not snapshot['activity_more']
             assert {r['key'] for s in snapshot['sessions'] for r in s['history']}=={'first','last'}
             assert not hasattr(client,'index') and not hasattr(client,'collector')
@@ -871,6 +872,7 @@ def test_idle_collector_keeps_nested_freshness_without_republishing_log_history(
              for i in range(2000)])
     service=CollectorService([home],path);reader=CollectionClient([home],path)
     try:
+        reader.set_demand(aggregate=True)
         service.channel.db.execute('PRAGMA wal_autocheckpoint=0')
         service.poll(now);initial=service.poll(now+2)
         assert initial['usage_collection_complete'] and len(initial['unassigned'])==2000
@@ -882,7 +884,7 @@ def test_idle_collector_keeps_nested_freshness_without_republishing_log_history(
             assert produced['last_usage_collection_success']==current
             assert produced['index']['last_usage_success']==current
             received=reader.poll(current)
-            assert {k:v for k,v in received.items() if k not in ('activity_cursor','activity_highwater','activity_more')}==produced
+            assert {k:v for k,v in received.items() if k not in ('activity_cursor','activity_highwater','activity_more','activity_live_start')}==produced
         assert wal.stat().st_size-initial_size<payload_size
     finally:reader.close();service.close()
 

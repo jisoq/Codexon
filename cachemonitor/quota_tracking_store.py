@@ -127,6 +127,7 @@ def sync_activity(db, snapshot, cache=None):
             continue
         complete = snapshot.get('usage_collection_complete', snapshot.get('index', {}).get('usage_complete', False))
         previous = db.execute('select * from tracking_health where home=?', (home,)).fetchone()
+        if snapshot.get('collection_partial'):complete=bool(previous and previous['complete'])
         if previous and snapshot['ts']-previous['at'] > 15:
             db.execute('insert or replace into tracking_gaps values(?,?,?)', (home, previous['at'], snapshot['ts']))
         db.execute('''insert into tracking_health values(?,?,?) on conflict(home) do update set

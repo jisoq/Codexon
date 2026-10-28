@@ -47,7 +47,7 @@ def _next_collector_wait(monkeypatch, snapshot, path):
     polled = []
 
     class Changes:
-        def __init__(self, *args, evidence=None):
+        def __init__(self, *args, evidence=None, demand=None):
             pass
 
         def sync(self, homes):
@@ -373,7 +373,7 @@ def test_early_pending_catalog_cap_keeps_uncatalogued_source_fallback(catching_s
     monkeypatch.setattr(CollectionReplay,'open',open_catalog)
     service.poll(20001)
     assert service.index.model_evidence.catching_up
-    assert service.index.replay.pending == {admitted}
+    assert service.index.replay.pending == set()
     assert set(rebuilt) == set(source.histories)
     complete = _collect_complete(service,20002)
     assert {row['id']:row['history'] for row in complete['sessions']} == source.histories

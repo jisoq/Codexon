@@ -111,6 +111,9 @@ class PreparedWriter:
         self.cache_floor=time.time() if cache_floor is None else cache_floor
         self.output = Mailbox(self.stopped)
         self.control = Controls()
+        self.selected=()
+        self.aggregate=None
+        self.demand_revision=0
         self.thread = Thread(target=self._run, name='prepared-writer', daemon=True)
         self.thread.start()
 
@@ -120,6 +123,18 @@ class PreparedWriter:
 
     def sync(self):
         self.control.put('sync')
+
+    def set_selected(self,selected):
+        with self.control.condition:
+            self.selected=tuple(tuple(owner) for owner in selected)
+            self.demand_revision+=1
+            self.control.put('demand')
+
+    def set_aggregate(self,request_id):
+        with self.control.condition:
+            self.aggregate=request_id
+            self.demand_revision+=1
+            self.control.put('demand')
 
     def set_cache_floor(self,value):
         import math
@@ -187,6 +202,7 @@ class PreparedWriter:
             from .mismatch_history import MismatchArchive,archive_path
             archive = MismatchArchive(archive_path(quota_path),self.stopped.is_set)
             collector = CollectionClient(homes,index_path,model_evidence_path)
+            collector.set_demand()
             store = PreparedStore(self.path,replace(Limits(),read_seconds=60,read_vm_steps=20_000_000),
                                   cancel=self.stopped.is_set)
             from .prepared_speed_writer import PreparedWarningWorker
@@ -212,6 +228,13 @@ class PreparedWriter:
             catalog_retries=0
             write_deferred=False
             cycle=None
+            demand_revision=-1
+            selected=()
+            aggregate=None
+            aggregate_complete=False
+
+            def cancelled():
+                return self.stopped.is_set() or demand_revision!=self.demand_revision
 
             def timing(value):
                 nonlocal last_timing
@@ -341,9 +364,11 @@ class PreparedWriter:
                 notification=(None if self.frozen.is_set() else
                               collector.notification_connection(catalog['publication']))
                 poll_at=time.monotonic()+3
-                if ledger is not None:
+                complete=catalog.get('aggregate_complete',True)
+                if ledger is not None and (complete or catalog['owners'] or snapshot.get('request_activity')):
                     try:
-                        batches=adapter.sync(snapshot,removed=ledger_removed)
+                        envelope=snapshot if complete else dict(snapshot,collection_partial=True)
+                        batches=adapter.sync(envelope,removed=ledger_removed if complete else ())
                         try:
                             for batch in batches:
                                 ledger_removed.difference_update(batch.get('retired',()))
@@ -362,8 +387,10 @@ class PreparedWriter:
                                 if interrupted:break
                         finally:batches.close()
                         if not interrupted:
-                            if snapshot.get('activity_cursor'):collector.channel.acknowledge_activity(snapshot)
-                            ledger_removed.clear()
+                            if snapshot.get('activity_live_cursor'):collector.channel.acknowledge_activity(snapshot)
+                            if complete:
+                                if snapshot.get('activity_cursor'):collector.channel.acknowledge_activity(snapshot)
+                                ledger_removed.clear()
                             if imported:ledger_issue=None;failures=0
                     except StaleGeneration:
                         # A source plan cannot certify facts from a later
@@ -410,6 +437,23 @@ class PreparedWriter:
                         blocked_publication=None
                         next_poll=0
                         publish(reset=True)
+                    if 'demand' in commands:
+                        with self.control.condition:
+                            changed_selection=selected!=self.selected
+                            selected,aggregate=self.selected,self.aggregate
+                            demand_revision=self.demand_revision
+                        collector.set_demand(selected,aggregate=aggregate is not None,
+                            evidence=() if changed_selection else collector.channel.demand['evidence'])
+                        if aggregate is not None and aggregate_complete and snapshot is not None:
+                            snapshot=dict(snapshot,aggregate_request=aggregate)
+                            publish()
+                        if changed_selection:
+                            initial=bool(selected)
+                            last_progress=None
+                            if initial:progress(PreparationStage.COLLECTING)
+                        next_poll=0
+                if demand_revision<0:
+                    demand_revision=self.demand_revision
                 if not write_deferred:finish_warnings()
                 if write_deferred:
                     # The failed cohort has unwound its own read scopes. Retire
@@ -451,6 +495,10 @@ class PreparedWriter:
                     try:
                         with cycle.measure('catalog'):
                             catalog=read_catalog(collector,cancel=self.stopped.is_set)
+                        demand=catalog['header'].get('demand')
+                        if demand is not None and (any(list(owner) not in demand['selected'] for owner in selected)
+                                or aggregate is not None and not demand['aggregate']):
+                            raise CollectionCatalogUnavailable('demand_pending')
                         index=catalog['header'].get('index',{})
                         progress(PreparationStage.COLLECTING,index.get('done'),index.get('files'))
                         catalog_received=True
@@ -475,13 +523,28 @@ class PreparedWriter:
                             next_poll=time.monotonic()+(3 if snapshot is not None else .1)
                         else:
                             progress(PreparationStage.CONVERTING)
+                            coordinator=PreparedCohort(store,collector,ledger,
+                                cancel=cancelled,speed_writer=speed_writer)
+                            with store.read_current(seconds=60) as current_view:
+                                admitted=set(coordinator._inventory(current_view))
+                            selected_members=catalog.get('selected_members',set())
+                            additions=[key for key in catalog['owners'] if key not in admitted and key not in selected_members]
+                            expanding=len(additions)>16
+                            if expanding:
+                                keep=admitted|selected_members|set(additions[:16])
+                                catalog=dict(catalog,mode_sources={**catalog.get('mode_sources',{}),
+                                    **{key:entry for key,entry in catalog['owners'].items() if key not in keep}},
+                                    owners={key:dict(entry,source_ordinal=ordinal)
+                                    for ordinal,(key,entry) in enumerate((item for item in catalog['owners'].items() if item[0] in keep))},
+                                    aggregate_complete=False)
                             if ledger is not None:
                                 try:
                                     with cycle.measure('mode_scan'):
-                                        ledger.scan_modes(catalog['selected_homes'])
+                                        ledger.scan_modes(catalog['selected_homes'],
+                                            owners=None if aggregate is not None else
+                                            set(catalog['owners'])|set(catalog.get('mode_sources',{})))
                                 except sqlite3.Error as error:disable(error)
-                            coordinator=PreparedCohort(store,collector,ledger,
-                                cancel=self.stopped.is_set,speed_writer=speed_writer)
+                            coordinator.ledger=ledger
                             with cycle.measure('conversion'):
                                 for change in coordinator.convert(catalog):
                                     if 'processed' in change:
@@ -490,8 +553,9 @@ class PreparedWriter:
                                     pending_changed.update(change['changed'])
                                     pending_changed.difference_update(change['removed'])
                                     pending_removed.update(change['removed'])
-                                    ledger_removed.difference_update(change['changed'])
-                                    ledger_removed.update(change['removed'])
+                                    if catalog.get('aggregate_complete',True):
+                                        ledger_removed.difference_update(change['changed'])
+                                        ledger_removed.update(change['removed'])
                                     maintenance_due=True
                                     if self.stopped.is_set():
                                         raise InterruptedError('prepared conversion cancelled')
@@ -519,8 +583,12 @@ class PreparedWriter:
                                                 tuple_token(store.token),tuple(pending_changed),tuple(pending_removed))
                             publisher.cache_floor=self.cache_floor
                             with cycle.measure('activity_page'):
-                                snapshot=collector.channel.activity_page(dict(catalog['header']),catalog['publication'][0])
-                            ledger_pending=ledger is not None
+                                snapshot=collector.channel.activity_page(dict(catalog['header']),catalog['publication'][0],
+                                    live=not catalog.get('aggregate_complete',True))
+                            aggregate_complete=catalog.get('aggregate_complete',True)
+                            snapshot['aggregate_request']=aggregate if aggregate_complete else None
+                            ledger_pending=ledger is not None and bool(catalog.get('aggregate_complete',True)
+                                or catalog['owners'] or snapshot.get('request_activity'))
                             if previous!=store.token:
                                 # A verified display need not await independent
                                 # accounting replay. Its pending status is explicit.
@@ -532,11 +600,15 @@ class PreparedWriter:
                             age=time.time()-snapshot['ts']
                             delay=.1 if snapshot['index'].get('loading') else (
                                 3 if notification is None or age>30 else min(ANALYSIS_IDLE_WAIT_SECONDS,max(.01,30-age+.01)))
-                            next_poll=0 if ledger_interrupted else time.monotonic()+delay
+                            next_poll=0 if ledger_interrupted or expanding else time.monotonic()+delay
                             catalog_retries=0
                     except CollectionCatalogUnavailable:
                         progress(PreparationStage.COLLECTING)
                         cycle.outcome='catalog_retry'
+                        # New demand may precede its first catalog. Its source
+                        # completion still advances the last valid publication.
+                        if not self.frozen.is_set() and catalog is not None:
+                            notification=collector.notification_connection(catalog['publication'])
                         # AppServices owns collector startup and restart. The
                         # query writer never starts a duplicate source reader.
                         if snapshot is not None and time.time()-snapshot['ts']>30 and not snapshot.get('collection_stale'):
@@ -564,6 +636,9 @@ class PreparedWriter:
                     except InterruptedError:
                         cycle.outcome='cancelled' if self.stopped.is_set() else 'failed'
                         if self.stopped.is_set():break
+                        if cancelled():
+                            next_poll=0
+                            continue
                         raise
                     except BaseException:
                         cycle.outcome='failed'
@@ -572,6 +647,7 @@ class PreparedWriter:
                         timing(cycle)
                         cycle=None
                 if (ledger is not None and snapshot is not None and not imported
+                        and catalog is not None and catalog.get('aggregate_complete',True)
                         and not snapshot['index'].get('loading') and time.monotonic()>=next_import):
                     import_step()
                     if imported or ledger is None:publish()
@@ -581,7 +657,7 @@ class PreparedWriter:
                 if maintenance_due or archive.has_work:delay=min(delay,.05)
                 if ledger is None:
                     delay=min(delay,max(0,ledger_retry-time.monotonic()))
-                elif snapshot is not None and not imported and not snapshot['index'].get('loading'):
+                elif snapshot is not None and not imported and not snapshot['index'].get('loading') and catalog.get('aggregate_complete',True):
                     delay=min(delay,max(0,next_import-time.monotonic()))
                 handles=[self.control.receiver]
                 if notification is not None:handles.append(notification)
@@ -627,6 +703,7 @@ def process_main(connection,homes,index_path,model_evidence_path,quota_path,cach
             raise
     actor=detail_actor=None
     current=None
+    aggregate_ready=None
     pending={}
     latest_query=None
     blocked_query_token=None
@@ -646,16 +723,28 @@ def process_main(connection,homes,index_path,model_evidence_path,quota_path,cach
                     if kind=='freeze':writer.freeze()
                     elif kind=='sync':writer.sync()
                     elif kind=='cache_floor':writer.set_cache_floor(message['value'])
+                    elif kind=='selected':
+                        writer.set_selected(message['owners'])
+                        detail_actor.cancel('overlay_detail')
+                        pending.pop('overlay_detail',None)
+                    elif kind=='aggregate_close':
+                        writer.set_aggregate(None)
+                        actor.cancel('query')
+                        pending.pop('query',None)
+                        latest_query=None;aggregate_ready=None
                     elif kind in ('query','overlay_detail','mismatch_page','mismatch_record'):
                         pending[kind]=message
                         if kind=='query':
                             latest_query=message;blocked_query_token=None
+                            actor.cancel('query')
+                            writer.set_aggregate(message['id'])
             if writer.output.receiver in ready:
                 message=writer.output.take()
                 if message['kind']=='fatal':
                     connection.send(message);return None
                 if message['kind']=='snapshot':
                     current=token_value(message.pop('token'))
+                    aggregate_ready=message['value'].get('aggregate_request')
                     journal.add(message.pop('transition'))
                 connection.send(message)
             for completed_actor in (actor,detail_actor):
@@ -674,6 +763,7 @@ def process_main(connection,homes,index_path,model_evidence_path,quota_path,cach
                     consumer.submit(pending.pop(archive_kind),None)
             if current is not None:
                 for kind,message in tuple(pending.items()):
+                    if kind=='query' and aggregate_ready!=message['id']:continue
                     if kind=='query' and blocked_query_token==tuple_token(current):continue
                     requested=message['summary'].get('_prepared_token') if kind=='overlay_detail' else None
                     token=token_value(requested) if requested is not None else current

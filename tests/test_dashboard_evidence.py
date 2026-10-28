@@ -46,6 +46,41 @@ def deliver_pending(window):
         result=window.engine.page_query(query),valid_until=float('inf')))
 
 
+def test_hidden_dashboard_restored_navigation_never_requests_aggregate_until_shown(tmp_path,monkeypatch):
+    from cachemonitor.analysis_worker import AnalysisBridge
+    from test_ui import wait_for_rendered
+    app=QApplication.instance() or QApplication([])
+    previous=app.property('cachemonitorDisableShellIntegration')
+    app.setProperty('cachemonitorDisableShellIntegration',True)
+    requests=[]
+    monkeypatch.setattr(AnalysisBridge,'start',lambda self:None)
+    monkeypatch.setattr(AnalysisBridge,'request',lambda self,*args:requests.append(args))
+    monkeypatch.setattr(Dashboard,'start_quota_service',lambda *args:None)
+    settings=QSettings(str(tmp_path/'demand.ini'),QSettings.IniFormat)
+    settings.setValue('dashboard/page',1)
+    window=None
+    try:
+        window=Dashboard([],settings=settings,index_path=tmp_path/'index.sqlite',
+            quota_path=tmp_path/'quota.sqlite',live_limits=False,collection_autostart=False)
+        assert not window.isVisible() and not requests
+        window.change_page(1)
+        window.render();window.render(automatic=True)
+        app.processEvents()
+        assert not requests
+        window.show()
+        wait_for_rendered(lambda:bool(requests))
+        assert requests[-1][1]['page']==1
+        window.hide()
+        before=len(requests)
+        window.render();window.render(automatic=True)
+        app.processEvents()
+        assert len(requests)==before
+        assert window.worker.last_request is None
+    finally:
+        if window is not None:close_dashboard(window)
+        app.setProperty('cachemonitorDisableShellIntegration',previous)
+
+
 @pytest.mark.parametrize('language',['ko','en'])
 def test_initial_preparation_reaches_native_dashboard_before_any_snapshot(tmp_path,monkeypatch,language):
     from PySide6.QtTest import QSignalSpy
@@ -167,8 +202,9 @@ def test_initial_preparation_reaches_native_dashboard_before_any_snapshot(tmp_pa
         assert window.home_panel.readiness=='empty'
         for node in (window.home_panel.readiness_title,window.home_panel.readiness_note):
             wait_for_rendered(lambda:control(window,node).isVisible())
+        loading=dict(window.analysis_loading)
         window.analysis_progressed(PreparationStage.STARTING)
-        assert window.preparation is None and not window.analysis_loading
+        assert window.preparation is None and window.analysis_loading==loading
         assert controller.preparation is None
         assert not window.qml_errors
     finally:

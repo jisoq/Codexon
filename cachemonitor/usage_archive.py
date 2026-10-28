@@ -4,9 +4,12 @@ import json
 from .core import Session
 
 
-def _load(db,homes):
+def _load(db,homes,owners=None):
     groups={};records={}
-    for home,rid,data in db.execute('SELECT home,response_id,data FROM usage_archive ORDER BY home,response_id'):
+    if owners is not None and not owners:return []
+    condition=(' WHERE '+' OR '.join("(home=? AND (json_extract(data,'$.sid')=? OR coalesce(nullif(json_extract(data,'$.purpose'),''),'imported')||':'||json_extract(data,'$.sid')=?))" for _ in owners)) if owners is not None else ''
+    parameters=tuple(part for home,sid in sorted(owners) for part in (home,sid,sid)) if owners is not None else ()
+    for home,rid,data in db.execute('SELECT home,response_id,data FROM usage_archive'+condition+' ORDER BY home,response_id',parameters):
         if home not in homes:continue
         row=json.loads(data);sid=row['sid'];purpose=row.get('purpose','')
         key=(home,sid,purpose)
@@ -54,13 +57,13 @@ class ArchiveSessions:
                 AFTER {action} ON main.usage_archive BEGIN
                 UPDATE usage_archive_revision SET value=value+1; END''')
 
-    def views(self,now,homes):
-        key=(frozenset(homes),self.db.execute('PRAGMA data_version').fetchone()[0],
+    def views(self,now,homes,owners=None):
+        key=(frozenset(homes),None if owners is None else frozenset(owners),self.db.execute('PRAGMA data_version').fetchone()[0],
              self.db.execute('SELECT value FROM usage_archive_revision').fetchone()[0])
         if key!=self.key:
             # data_version conservatively reloads after another connection commits.
             # No cursor or source JSON survives the reconstruction.
-            groups=_load(self.db,homes)
+            groups=_load(self.db,homes,owners)
             # A rollback also restores the TEMP revision counter. Do not publish
             # transactional values under a revision a later write could reuse.
             if self.db.in_transaction:

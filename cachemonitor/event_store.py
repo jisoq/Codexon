@@ -238,9 +238,9 @@ class EventStore:
         db.execute(f'''CREATE TRIGGER events_delete INSTEAD OF DELETE ON events BEGIN
             DELETE FROM event_records WHERE {old}; {legacy_delete} END''')
 
-    def migrate(self, deadline=None):
+    def migrate(self, deadline=None, *, owners=None):
         """Move a bounded batch atomically; callers must have no replay cursor."""
-        if not self.pending or self.db.in_transaction:return 0
+        if not self.pending or self.db.in_transaction or owners is not None and not owners:return 0
         db=self.db
         try:
             if shutil.disk_usage(self.path.parent).free<16*1024*1024:return 0
@@ -258,9 +258,11 @@ class EventStore:
             # Bound that work too, then restore the connection's normal limit.
             previous_limit=db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH,MAX_MIGRATION_ROW)
             try:
+                owner_filter=(' AND ('+' OR '.join('(home=? AND tid=?)' for _ in owners)+')') if owners is not None else ''
+                owner_values=tuple(part for owner in sorted(owners) for part in owner) if owners is not None else ()
                 cursor=db.execute('''SELECT rowid,path,pos,home,tid,ts,data FROM events_legacy
-                    WHERE data IS NULL OR length(cast(data AS BLOB))<=? ORDER BY rowid LIMIT ?''',
-                    (MAX_PAYLOAD,MIGRATION_ROWS))
+                    WHERE (data IS NULL OR length(cast(data AS BLOB))<=?)'''+owner_filter+' ORDER BY rowid LIMIT ?',
+                    (MAX_PAYLOAD,*owner_values,MIGRATION_ROWS))
                 try:
                     for row in cursor:
                         weight=sum(len(v)*4 if isinstance(v,str) else len(v) if isinstance(v,bytes) else 32 for v in row)
@@ -287,7 +289,7 @@ class EventStore:
                 self._views()
                 db.execute('DROP TABLE events_legacy')
             db.commit()
-            self.pending=self.legacy and bool(batch)
+            self.pending=self.legacy and (owners is not None or bool(batch))
             return len(batch)
         except (OSError,sqlite3.Error,ValueError) as error:
             db.rollback()

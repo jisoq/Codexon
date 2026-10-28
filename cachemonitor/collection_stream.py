@@ -211,7 +211,7 @@ class SelectedOwnerStream(_SessionJSON):
         token=channel._catalog_token(catalog)
         if not isinstance(key,(tuple,list)) or len(key)!=2 or not all(isinstance(part,str) for part in key):
             raise CollectionScopeError('수집 목록의 선택 세션이 일치하지 않습니다.')
-        self.key=tuple(key);entry=catalog.get('owners',{}).get(self.key)
+        self.key=tuple(key);entry=catalog.get('owners',{}).get(self.key) or catalog.get('mode_sources',{}).get(self.key)
         if entry is None or self.key[0] not in channel.homes:raise CollectionCatalogUnavailable('missing')
         digest=entry.get('body_digest')
         if not isinstance(digest,str) or len(digest)!=64:raise CollectionScopeError('수집 본문의 검증값이 없습니다.')

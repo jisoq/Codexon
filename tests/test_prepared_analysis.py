@@ -2053,7 +2053,9 @@ def test_overlay_detail_completes_without_restarting_pending_page(tmp_path, monk
     page_starts = []
     failures = []
     writer = SimpleNamespace(path=tmp_path/'prepared.sqlite', output=output,
-                             close=lambda:closed.append('writer'))
+                             close=lambda:closed.append('writer'),
+                             set_aggregate=lambda request_id:output.put(dict(kind='snapshot',
+                                 value=dict(aggregate_request=request_id),token=('instance',1),transition=None)))
     monkeypatch.setattr(prepared_runtime, 'PreparedWriter', lambda *args:writer)
     class Handler:
         def __init__(self, path):pass

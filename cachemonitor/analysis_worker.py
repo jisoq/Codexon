@@ -169,12 +169,25 @@ class AnalysisBridge(QThread):
         self.process=None
         self.restart_count=0
         self.last_request=None
+        self.selected_owners=[]
         self.outstanding_mismatches={}
     def request(self,request_id,query,logical):
         with self.lock:
             self.pending={'kind':'query','id':request_id,'query':query,'logical':logical}
             self.last_request=self.pending
             self._wake_locked()
+
+    def select_session(self,thread_id=None,home=None):
+        owners=[[home,thread_id]] if thread_id else []
+        with self.lock:
+            if owners==self.selected_owners:return
+            self.selected_owners=owners
+            self.enqueue_latest(dict(kind='selected',owners=owners))
+
+    def cancel_queries(self):
+        with self.lock:
+            self.pending=None;self.last_request=None
+            self.enqueue_latest(dict(kind='aggregate_close'))
     def enqueue_latest(self,command):
         # Each consumer accepts only its newest request id. Keep one pending
         # command per kind while the child is busy, including a single snapshot.
@@ -355,5 +368,6 @@ class AnalysisBridge(QThread):
             with self.lock:
                 self.pending=self.last_request
                 if self.pending:self._wake_locked()
+                self.enqueue_latest(dict(kind='selected',owners=self.selected_owners))
                 for command in self.outstanding_mismatches.values():self.enqueue_latest(command)
             self.msleep(250)

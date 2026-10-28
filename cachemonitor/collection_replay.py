@@ -132,10 +132,10 @@ class CollectionReplay:
 
     def reader_version(self):
         reader = self.index.model_evidence
-        if reader.error or reader.catching_up:
+        if reader.error or reader.catching_up and (self.index.demand is None or self.index.demand['aggregate']):
             return None
         version = reader.db.execute('PRAGMA data_version').fetchone()[0] if reader.db is not None else None
-        return reader.identity, reader.generation, reader.offset, version
+        return reader.identity, reader.generation, reader.highwater, version
 
     def begin(self, now):
         if not self.available:
@@ -179,6 +179,8 @@ class CollectionReplay:
                         'SELECT o.home,o.sid FROM responses r JOIN owners o ON o.id=r.owner WHERE r.key=?',
                         (response_key(home, key),)))
         self.join_epoch = reader.join_epoch
+        if self.index.demand is not None:
+            self.pending.intersection_update(self.index.active_sources)
         if reader.error:
             self.pending.clear()
         else:
@@ -186,6 +188,13 @@ class CollectionReplay:
         if not self.pending and self.restore_job is not None:
             self.restore_job.close();self.restore_job = None
         version = self.reader_version()
+        if self.index.demand is not None and not self.index.demand['aggregate']:
+            self.pending.clear()
+            if self.restore_job is not None:
+                self.restore_job.close();self.restore_job=None
+            self.started=True
+            self.evidence_version=version
+            return
         if version is None:
             return
         initial = not self.started
@@ -292,7 +301,7 @@ class CollectionReplay:
                             self.db.execute('UPDATE owners SET header=?,integrity=? WHERE id=? AND integrity=?',
                                 (header, integrity(proof, header, digest, fingerprint, evidence), owner, checksum))
                 body = EncodedSession(state['header'], saved[0], fingerprint, digest)
-                self._retire(key, body, state['session'])
+                self._retire(key, body, state['session'], reader.offset)
             except (KeyError, TypeError, ValueError, CollectionCatalogUnavailable, CollectionScopeError):
                 continue
         self.index.cached_restore = deque(key for key in self.index.cached_restore if key not in self.index.loaded)
@@ -304,7 +313,7 @@ class CollectionReplay:
         return {**{field: getattr(session, field) for field in fields},
                 'transports': [dict(vars(value)) for value in session.transports]}
 
-    def _retire(self, key, body, state):
+    def _retire(self, key, body, state, evidence_bound):
         session = Session(key[1], key[0])
         for field, value in state.items():
             if field != 'transports':
@@ -314,6 +323,7 @@ class CollectionReplay:
         # Preserve absent versus explicit null without decoding its history.
         body['_owner_lineage']={field:state[field] for field in ('parent_thread_id',) if field in state}
         session._replay_body = body
+        session._replay_evidence_bound = evidence_bound
         session._replay_state = self.session_state(session)
         session._replay_metadata = self.index.metadata.get(key, {})
         self.index.monitor.sessions[key] = session
@@ -328,7 +338,15 @@ class CollectionReplay:
 
     def view(self, key, session, ready, now):
         body = session._replay_body
+        reader = self.index.model_evidence
+        bound = session._replay_evidence_bound
+        if reader.invalidation_range[0] <= bound <= reader.invalidation_range[1]:
+            bound = reader.invalidation_range[1]
+            session._replay_evidence_bound = bound
+        if reader.catching_up and (self.index.demand is None or key not in self.index.selected_members):
+            ready = False
         if (key in self.invalidated or body['activity'] >= now - WINDOW
+                or ready and bound != reader.highwater
                 or session._replay_metadata != self.index.metadata.get(key, {})
                 or session._replay_state != self.session_state(session)):
             if key not in self.index.pending_rebuilds:
@@ -519,7 +537,7 @@ class CollectionReplay:
             self.db.executemany('DELETE FROM responses WHERE owner=? AND key=?', ((owner, response) for response in removed))
             self.db.executemany('INSERT INTO responses VALUES(?,?)', ((owner, response) for response in added))
             body = EncodedSession(header, prepared[2], prepared[1], prepared[3])
-            self._retire(key, body, state)
+            self._retire(key, body, state, session._evidence_join[5])
             views[position] = body
             self.pending_admissions.add(key)
             self.pending_bytes += len(proof) + len(packed) + 128 + 64 * (len(removed) + len(added))

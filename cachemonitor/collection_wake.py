@@ -24,7 +24,7 @@ class SourceChanges:
     RESCAN_SECONDS = 3.
     METADATA_SECONDS = .25
 
-    def __init__(self, excluded=(), *, evidence=None):
+    def __init__(self, excluded=(), *, evidence=None, demand=None):
         self.handles = {}; self.next_sync = 0.
         self.metadata = {}; self.next_metadata = 0.
         self.last_wake = float('-inf')
@@ -32,6 +32,8 @@ class SourceChanges:
         evidence = Path(evidence).resolve() if evidence is not None else None
         self.evidence = (evidence, evidence.with_name(evidence.name+'-wal')) if evidence is not None else ()
         self.evidence_signature = self._signature(self.evidence)
+        self.demand=demand
+        self.demand_revision=demand() if demand is not None else None
         self.api = None
         if os.name != 'nt': return
         try:
@@ -99,7 +101,10 @@ class SourceChanges:
         current = self._signature(self.evidence)
         evidence_changed = current != self.evidence_signature
         self.evidence_signature = current
-        return SourceHint(uncertain=evidence_changed, metadata=frozenset(changed))
+        revision=self.demand() if self.demand is not None else None
+        demand_changed=revision!=self.demand_revision
+        self.demand_revision=revision
+        return SourceHint(uncertain=evidence_changed or demand_changed, metadata=frozenset(changed))
 
     def wait(self, deadline):
         """Return a coalesced hint, never a claim that all source writes are durable."""

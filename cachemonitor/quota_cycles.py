@@ -1362,7 +1362,7 @@ class QuotaLedger:
                 session_key=key[:2]
                 self.mode_revisions[session_key]=self.mode_revisions.get(session_key,0)+1
 
-    def scan_modes(self, homes):
+    def scan_modes(self, homes, *, owners=None):
         from contextlib import closing
         from .request_modes import request_mode_observation
         # Bound source work separately from retained bodies so sparse handler
@@ -1372,6 +1372,9 @@ class QuotaLedger:
         def scan(source,condition='',parameters=(),reverse=False):
             rows=[];first=last=None
             order=' desc' if reverse else ''
+            if selected_sid is not None:
+                condition+=(' AND ' if condition else ' WHERE ')+"thread_id=? AND target='codex_core::session::handlers'"
+                parameters=(*parameters,selected_sid)
             with closing(source.execute(columns+condition+' order by id'+order+' limit ?',
                                         (*parameters,MODE_SCAN_ROWS))) as cursor:
                 for row in cursor:
@@ -1381,26 +1384,28 @@ class QuotaLedger:
                         rows.append(row)
                         if len(rows)>=MODE_SCAN_MATCHES:break
             return rows,first,last
-        for home in homes:
+        sources=((home,None) for home in homes) if owners is None else iter(sorted(owners))
+        for home,selected_sid in sources:
+            cursor_key=home if selected_sid is None else (home,selected_sid)
             path=Path(home)/'logs_2.sqlite'
             if not path.exists():continue
             try:
                 with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=.3)) as source:
                     maximum=source.execute('select max(id) from logs').fetchone()[0] or 0
-                    if maximum<self.mode_offsets.get(home,0):
-                        self.mode_offsets.pop(home,None);self.mode_backfill.pop(home,None)
-                    if home not in self.mode_offsets:
+                    if maximum<self.mode_offsets.get(cursor_key,0):
+                        self.mode_offsets.pop(cursor_key,None);self.mode_backfill.pop(cursor_key,None)
+                    if cursor_key not in self.mode_offsets:
                         rows,first,last=scan(source,reverse=True)
                         rows.reverse()
                         latest=first or 0
-                        self.mode_backfill[home]=last or 0
+                        self.mode_backfill[cursor_key]=last or 0
                     else:
-                        rows,_,last=scan(source,' where id>?',(self.mode_offsets[home],))
-                        latest=last if last is not None else self.mode_offsets[home]
-                    before=self.mode_backfill.get(home,0)
+                        rows,_,last=scan(source,' where id>?',(self.mode_offsets[cursor_key],))
+                        latest=last if last is not None else self.mode_offsets[cursor_key]
+                    before=self.mode_backfill.get(cursor_key,0)
                     if before:
                         older,_,last=scan(source,' where id<?',(before,),reverse=True)
-                        self.mode_backfill[home]=last or 0
+                        self.mode_backfill[cursor_key]=last or 0
                         rows=older[::-1]+rows
                 changed=False
                 for identifier,sid,body in rows:
@@ -1413,9 +1418,10 @@ class QuotaLedger:
                             self.db.execute('insert or replace into mode_events values(?,?,?,?,?)',
                                             (home,identifier,sid,parsed['turn'],data));changed=True
                 if changed:self.rebuild_mode_evidence(home)
-                self.mode_offsets[home]=latest
-                checkpoint=(latest,self.mode_backfill.get(home,0))
-                saved=self.db.execute('select latest,before_id from mode_scan where home=?',(home,)).fetchone()
+                self.mode_offsets[cursor_key]=latest
+                if selected_sid is not None:continue
+                checkpoint=(latest,self.mode_backfill.get(cursor_key,0))
+                saved=self.db.execute('select latest,before_id from mode_scan where home=?',(cursor_key,)).fetchone()
                 # A conditional UPSERT still opens a write transaction when
                 # nothing changed. Read the durable cursor before taking that
                 # lock; do not trust the in-memory scan cursor after failures.
@@ -1423,7 +1429,7 @@ class QuotaLedger:
                     self.db.execute('''insert into mode_scan values(?,?,?) on conflict(home) do update set
                         latest=excluded.latest,before_id=excluded.before_id
                         where mode_scan.latest is not excluded.latest or mode_scan.before_id is not excluded.before_id''',
-                        (home,*checkpoint))
+                        (cursor_key,*checkpoint))
             except sqlite3.Error:pass
         self.db.commit()
 
@@ -1624,7 +1630,7 @@ class QuotaLedger:
                 self.db.executemany('delete from calls where home=? and sid=? and uid=?',
                                     [(home,sid,uid) for uid in old_uids-current_uids])
             if applied_sources is not None:certificates[key]=revision
-        for home in snapshot.get('homes', []):
+        for home in (() if snapshot.get('collection_partial') else snapshot.get('homes', [])):
             usage_errors=snapshot.get('usage_errors')
             if usage_errors is None:
                 usage_errors=[error for error in snapshot.get('errors',[])

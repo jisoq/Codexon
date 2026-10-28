@@ -172,6 +172,7 @@ class LiveCollection:
     def __init__(self,path,scope,*,recovery=None):
         self.path=str(path);self.scope=scope;self.lock=threading.Lock()
         self.leases={};self.current=None
+        self.demand_revision=0
         self.recovery=recovery
         self.changed=threading.Condition(self.lock);self.closed=False;self.waiters=set()
 
@@ -319,7 +320,14 @@ class LiveCollection:
     def requested_homes(self,now):
         with self.lock:
             self.leases={key:value for key,value in self.leases.items() if value[1]>=now-60}
-            return list(dict.fromkeys(home for homes,_ in self.leases.values() for home in homes))
+            return list(dict.fromkeys(home for homes,_,_ in self.leases.values() for home in homes))
+
+    def requested_demand(self,now):
+        with self.lock:
+            values=[value[2] for value in self.leases.values() if value[1]>=now-60]
+            return dict(selected=list(dict.fromkeys(tuple(owner) for value in values for owner in value['selected'])),
+                        aggregate=any(value['aggregate'] for value in values),
+                        evidence=list(dict.fromkeys(tuple(owner) for value in values for owner in value['evidence'])))
 
     def request(self,value):
         if value.get('scope')!=self.scope or not isinstance(value.get('path'),str) or os.path.normcase(value['path'])!=os.path.normcase(self.path):
@@ -331,8 +339,21 @@ class LiveCollection:
                 if not isinstance(homes,list) or not all(isinstance(home,str) for home in homes):
                     return dict(error='homes'),b''
                 if value.get('close'):
-                    self.leases.pop(client,None);self.changed.notify_all()
-                else:self.leases[client]=(homes,time.time())
+                    old=self.leases.pop(client,None)
+                    if old is not None and (old[2]['selected'] or old[2]['aggregate'] or old[2]['evidence']):self.demand_revision+=1
+                    self.changed.notify_all()
+                else:
+                    previous=self.leases.get(client,(None,None,dict(selected=[],aggregate=False,evidence=[])))[2]
+                    demand=value.get('demand',previous)
+                    if (not isinstance(demand,dict) or type(demand.get('aggregate')) is not bool
+                            or any(not isinstance(demand.get(field),list) or any(
+                                not isinstance(owner,(list,tuple)) or len(owner)!=2
+                                or owner[0] is not None and not isinstance(owner[0],str)
+                                or not isinstance(owner[1],str) for owner in demand[field])
+                                for field in ('selected','evidence'))):
+                        return dict(error='demand'),b''
+                    self.leases[client]=(homes,time.time(),demand)
+                    if demand!=previous:self.demand_revision+=1
             current=self.current
             recovery=self.recovery
             if value.get('watch')==1:
@@ -407,7 +428,7 @@ class LiveCollection:
         allowed=set(homes);kind=value.get('read')
         try:
             header=current['header'];_catalog_weight(header,CATALOG_HEADER_BYTES)
-            complete=bool(header.get('usage_collection_complete') and not header.get('index',{}).get('loading')
+            complete=bool(header.get('catalog_complete',header.get('usage_collection_complete') and not header.get('index',{}).get('loading'))
                           and allowed.issubset(header.get('homes',[])))
             if kind=='catalog':
                 offset=value.get('offset',0)
@@ -509,6 +530,7 @@ class CollectionHeaderReader:
         self.snapshot_path=self.companion('.collection.sqlite')
         self.client=uuid.uuid4().hex
         self.header=None;self.publication=None;self.last_read_live=False
+        self.demand=dict(selected=[],aggregate=False,evidence=[])
 
     def companion(self,suffix):
         return self.path.with_name(self.path.name+'.codexon-'+suffix.lstrip('.'))
@@ -519,7 +541,7 @@ class CollectionHeaderReader:
     def live_request(self,**value):
         from .collection_transport import request
         return request(self.companion('.collection-live.json'),
-                       dict(path=str(self.path),scope=self.scope,client=self.client,homes=self.homes,**value),
+                       dict(path=str(self.path),scope=self.scope,client=self.client,homes=self.homes,demand=self.demand,**value),
                        response_limits=(CATALOG_PAGE_BYTES,0) if value.get('header_only') else None)
 
     def validate_header(self,header):
@@ -680,7 +702,8 @@ class CollectionChannel(CollectionHeaderReader):
     def publish(self,snapshot,epoch,sequence,*,changes=None):
         self.removed_sessions=()
         if snapshot.get('activity_stream'):
-            snapshot={**snapshot,'activity_highwater':getattr(self,'activity_row_revision',0)}
+            snapshot={**snapshot,'activity_highwater':getattr(self,'activity_row_revision',0),
+                      'activity_live_start':getattr(self,'activity_live_start',0)}
         candidate=self.live.prepare(snapshot,epoch,sequence,changes=changes) if self.live else None
         if candidate is not None and self.live.current is not None and candidate['durable']==self.live.current['durable']:
             candidate['catalog_identity']=self.live.current.get('catalog_identity')
@@ -744,6 +767,11 @@ class CollectionChannel(CollectionHeaderReader):
                 activity_row_revision=self.db.execute('SELECT coalesce(max(revision),0) FROM activity').fetchone()[0]
                 if prior_source!=snapshot.get('activity_source') or snapshot.get('activity_source_limit',prior_limit)<prior_limit:
                     self.db.execute('DELETE FROM activity')
+                    self.activity_live_start=activity_row_revision
+                elif not hasattr(self,'activity_live_start'):
+                    self.activity_live_start=activity_row_revision
+                header['activity_live_start']=self.activity_live_start
+                if candidate is not None:candidate['header']['activity_live_start']=self.activity_live_start
                 for record in snapshot.get('request_activity',[]):
                     payload=zlib.compress(json.dumps(record,ensure_ascii=False,separators=(',',':')).encode(),1)
                     old=self.db.execute('SELECT payload FROM activity WHERE home=? AND attempt=?',
@@ -808,13 +836,14 @@ class CollectionChannel(CollectionHeaderReader):
     def read_header(self):
         return self.read(header_only=True)
 
-    def activity_page(self,result,epoch):
+    def activity_page(self,result,epoch,*,live=False):
         if not result.get('activity_stream'):return result
         result={key:value for key,value in result.items() if key!='activity_revision'}
         epoch=f"{self.snapshot_path}:{self.scope}:{result.get('activity_source')}"
         highwater=result.get('activity_highwater',0)
-        acknowledged=getattr(self,'activity_ack',None)
-        after=acknowledged[1] if acknowledged and acknowledged[0]==epoch else 0
+        acknowledged=getattr(self,'activity_live_ack' if live else 'activity_ack',None)
+        after=(acknowledged[1] if acknowledged and acknowledged[0]==epoch else
+               result.get('activity_live_start',0) if live else 0)
         if after>highwater:after=0
         with closing(sqlite3.connect(self.snapshot_path.as_uri()+'?mode=ro',uri=True)) as db:
             rows=db.execute('SELECT revision,payload FROM activity WHERE revision>? AND revision<=? '
@@ -822,13 +851,15 @@ class CollectionChannel(CollectionHeaderReader):
         end=rows[-1][0] if len(rows)==512 else highwater
         more=end<highwater
         return {**result,'request_activity':[json.loads(zlib.decompress(row[1])) for row in rows],
-            'activity_cursor':(epoch,end),'activity_more':more,
+            ('activity_live_cursor' if live else 'activity_cursor'):(epoch,end),'activity_more':more,
             **({'usage_collection_complete':False,'index':{**result['index'],'loading':True,'usage_complete':False}}
                if more else {})}
 
     def acknowledge_activity(self,snapshot):
         cursor=snapshot.get('activity_cursor')
         if cursor:self.activity_ack=tuple(cursor)
+        live_cursor=snapshot.get('activity_live_cursor')
+        if live_cursor:self.activity_live_ack=tuple(live_cursor)
 
     def _cached_body(self,key,digest):
         if not digest:return None
@@ -968,7 +999,7 @@ class CollectionChannel(CollectionHeaderReader):
         from .collection_transport import request
         response=request(self.companion('.collection-live.json'),
             dict(path=str(self.path),scope=self.scope,client=self.client,homes=self.homes,
-                 protocol=CATALOG_PROTOCOL,**value),
+                 demand=self.demand,protocol=CATALOG_PROTOCOL,**value),
             response_limits=(CATALOG_PAGE_BYTES,0 if value.get('read')=='catalog' else SELECTED_BODY_BYTES))
         if response is None:raise CollectionCatalogUnavailable('transport')
         metadata,body=response
@@ -1304,6 +1335,20 @@ class CollectionClient:
         self.notification_epoch=None
         self.notification_baseline=None
         self.analysis_identity=None
+        self.active_demand=None
+
+    def set_demand(self,selected=(),*,aggregate=False,evidence=()):
+        demand=dict(selected=[list(owner) for owner in selected],aggregate=aggregate,
+                    evidence=[list(owner) for owner in evidence])
+        self.active_demand=demand
+        self.channel.demand=demand
+        if self.waiter is not None:self.waiter.value['demand']=demand
+        self.channel.live_request(lease_only=True)
+
+    def request_mode_sources(self,owners):
+        demand=self.channel.demand
+        self.set_demand(demand['selected'],aggregate=demand['aggregate'],
+                        evidence=list(dict.fromkeys([tuple(key) for key in demand['evidence']]+list(owners))))
 
     @staticmethod
     def _notification_identity(publication):
@@ -1324,7 +1369,8 @@ class CollectionClient:
         if self.waiter is None:
             from .collection_transport import PublicationWaiter
             self.waiter=PublicationWaiter(self.channel.companion('.collection-live.json'),
-                dict(path=str(self.path),scope=self.channel.scope,client=self.channel.client,homes=self.channel.homes))
+                dict(path=str(self.path),scope=self.channel.scope,client=self.channel.client,
+                     homes=self.channel.homes,demand=self.channel.demand))
             self.notification_epoch=epoch
         self.notification_baseline=publication if explicit else None
         self.waiter.arm(list(publication))
@@ -1349,6 +1395,7 @@ class CollectionClient:
 
     def poll(self,now=None):
         now=now or time.time()
+        self.set_demand(aggregate=True)
         self.analysis_identity=None
         try:
             snapshot=self.channel.read(shared=True)
@@ -1361,6 +1408,8 @@ class CollectionClient:
         if snapshot is not None and not self.channel.last_read_live:
             snapshot={**snapshot,'collection_recovery':True}
         if snapshot is None:snapshot=empty_snapshot(self.channel.homes,self.path,now)
+        if snapshot.get('demand') is not None and not snapshot['demand']['aggregate']:
+            snapshot=dict(snapshot,usage_collection_complete=False,index=dict(snapshot['index'],loading=True,usage_complete=False))
         # Freshness belongs to this read, not the shared source snapshot or its
         # error list. A late read must not contaminate a later cache recovery.
         snapshot={**snapshot}
@@ -1467,6 +1516,9 @@ class CollectorService:
             self.index.db.commit()  # Finish schema and TEMP revision setup before replay proofs.
             from .collection_replay import CollectionReplay
             self.index.replay=CollectionReplay.open(self.channel,self.index,restore_metadata=False)
+        demand=self.channel.live.requested_demand(now)
+        if detailed:demand['aggregate']=True
+        self.index.demand=demand
         snapshot=(self.index.poll(now) if source_hint is None else
                   self.index.poll(now,source_hint=source_hint))
         source_snapshot=snapshot
@@ -1546,7 +1598,8 @@ def main():
     first=True;changes=None;source_hint=None
     try:
         from .collection_wake import SourceChanges
-        changes=SourceChanges((service.channel.path,service.channel.snapshot_path,evidence),evidence=evidence)
+        changes=SourceChanges((service.channel.path,service.channel.snapshot_path,evidence),evidence=evidence,
+            demand=lambda:service.channel.live.demand_revision)
         changes.sync(service.channel.homes)
         while not service.stopping():
             snapshot=service.poll(detailed=False,source_hint=source_hint)

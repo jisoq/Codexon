@@ -121,6 +121,26 @@ def test_notification_failure_releases_socket_and_allows_polling_recovery(tmp_pa
     finally:reader.close();writer.close()
 
 
+def test_notification_lease_restores_latest_demand_after_lease_loss(tmp_path):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=CollectionClient(writer.homes,writer.path)
+    writer.start_live()
+    try:
+        value=snapshot(writer);writer.publish(value,'epoch',1)
+        reader.set_demand([(None,'first')])
+        wake=reader.notification_connection(('epoch',1))
+        wait_until(lambda:bool(writer.live.waiters))
+        reader.set_demand([(None,'second')],aggregate=True,evidence=[(writer.homes[0],'parent')])
+        writer.publish(value,'epoch',2)
+        assert wake.poll(2) and reader.consume_notification()
+        with writer.live.lock:writer.live.leases.pop(reader.channel.client)
+        reader.notification_connection(('epoch',2))
+        wait_until(lambda:reader.channel.client in writer.live.leases)
+        assert writer.live.requested_demand(time.time())==dict(selected=[(None,'second')],aggregate=True,
+            evidence=[(writer.homes[0],'parent')])
+    finally:reader.close();writer.close()
+
+
 def test_benchmark_trace_instances_keep_concurrent_records_complete(tmp_path):
     import json
     from threading import Barrier, Thread
