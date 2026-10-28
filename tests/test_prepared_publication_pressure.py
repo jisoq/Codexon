@@ -286,7 +286,7 @@ def test_publisher_fragments_each_project_path_through_mailbox(tmp_path, abandon
                 value.update(id=f'session-{ordinal:03d}', cwd=path,
                              project='unassigned:home', project_name='Scratch')
                 stage_owner(stage, prepare_owner(value, owns=lambda *_: True),
-                            dict.fromkeys(storage.DEPENDENCIES, 1), ordinal)
+                            dict(dict.fromkeys(storage.DEPENDENCIES, 1), source_digest=f'{1:064x}'), ordinal)
             stage.publish(('source', 1), ready=True)
             publisher = PreparedPublisher(0)
             publisher.adopt(store, [('home', f'session-{number:03d}') for number in range(48)],

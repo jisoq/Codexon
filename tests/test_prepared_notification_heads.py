@@ -98,7 +98,7 @@ def test_publication_preserves_unselected_cache_incident_lifecycle(tmp_path, sel
                 value.update(id=sid, title=title if sid == 'b' else 'A')
                 material = prepare_owner(value, owns=lambda *_: True)
                 key = stage_owner(stage, material,
-                    dict.fromkeys(storage.DEPENDENCIES, revision), ordinal)
+                    dict(dict.fromkeys(storage.DEPENDENCIES, revision), source_digest=f'{revision:064x}'), ordinal)
                 own = dict(material['summary']['own'],
                     cache_misses=dict(count=3, events=[
                         dict(ts=stamp, key=f'{sid}-{stamp}') for stamp in (99, 100, 101)]),
