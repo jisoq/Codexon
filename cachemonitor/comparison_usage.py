@@ -100,13 +100,18 @@ class Totals:
         return {key:value._asdict() for key,value in zip(METRICS,self.metrics())}
 
 
+class _OwnerCacheUnavailable(CapacityExceeded):
+    pass
+
+
 class _Budget:
-    def __init__(self,maximum):
+    def __init__(self,maximum,*,exhausted=CapacityExceeded):
         self.maximum=maximum;self.used=0;self.peak=0
+        self.exhausted=exhausted
 
     def reserve(self,size):
         if self.used+size>self.maximum:
-            raise CapacityExceeded('comparison aggregates exceed cache budget')
+            raise self.exhausted('comparison aggregates exceed cache budget')
         self.used+=size;self.peak=max(self.peak,self.used)
 
     def release(self,size):
@@ -292,6 +297,9 @@ class GroupAggregate:
         change=self.totals.retained_bytes()-before
         if change>0:budget.reserve(change)
         else:budget.release(-change)
+        self.observe(accepted,budget)
+
+    def observe(self,accepted,budget):
         for metric,field in MEAN_FIELDS.items():
             if accepted[field] is not None:self.observations[metric].add(accepted[field],budget)
 
@@ -367,7 +375,7 @@ def _owner_data(engine,scope,dimension,cache,budget):
                     if (proof.get('format')==1 and proof.get('prior')==old['stamp']
                             and proof.get('target')==stamp and type(proof.get('ordinal')) is int):
                         ordinal=proof['ordinal']+1
-                local=_Budget(budget.maximum-budget.used-overhead)
+                local=_Budget(budget.maximum-budget.used-overhead,exhausted=budget.exhausted)
                 if ordinal is not None:
                     local.reserve(sum(256+_size(key)+_size(label)+value.clone_bytes()
                                       for key,(label,value) in old['groups'].items()))
@@ -377,6 +385,7 @@ def _owner_data(engine,scope,dimension,cache,budget):
                 while True:
                     page=snapshot.projected_calls(owner,FIELDS,start=lo,end=hi,after=after,
                                                   filters=scope,ordinal_start=ordinal)
+                    engine.read_metrics['category_projection_rows']=engine.read_metrics.get('category_projection_rows',0)+len(page.rows)
                     for row in page.rows:
                         processed+=1
                         if matches(row,scope):add_row(groups,row,dimension,local)
@@ -390,7 +399,6 @@ def _owner_data(engine,scope,dimension,cache,budget):
             reused+=sum(value[1].totals.count for value in entry['groups'].values())
         budget.reserve(entry['weight']+overhead)
         entries[owner]=entry
-    engine.read_metrics['category_projection_rows']=engine.read_metrics.get('category_projection_rows',0)+processed
     engine.read_metrics['comparison_reused_calls']=reused
     engine.read_metrics['comparison_cache_bytes']=budget.used
     return entries
@@ -435,10 +443,14 @@ def _fold(entries,budget):
             totals.merge(value.totals);total.merge(value.totals)
             budget.reserve(totals.retained_bytes()+total.retained_bytes()-before+4*calcsize('P'))
             parts.append(value)
-    scratch=sys.getsizeof([])+len(groups)*calcsize('P')
-    budget.reserve(scratch+_tuple_bytes(len(groups)))
-    rows=[None]*len(groups)
-    for i,(key,(label,totals,parts)) in enumerate(groups.items()):
+    return _finish_fold(iter(groups.items()),len(groups),total,sessions,budget)
+
+
+def _finish_fold(groups,count,total,sessions,budget):
+    scratch=sys.getsizeof([])+count*calcsize('P')
+    budget.reserve(scratch+_tuple_bytes(count))
+    rows=[None]*count
+    for i,(key,(label,totals,parts)) in enumerate(groups):
         budget.reserve(_tuple_bytes(4)+_size(key)+_size(label)+_tuple_bytes(len(MEAN_FIELDS)))
         metrics=totals.metrics(budget)
         box_scratch=sys.getsizeof([])+2*len(MEAN_FIELDS)*calcsize('P')
@@ -458,6 +470,59 @@ def _fold(entries,budget):
     if size>budget.used:budget.reserve(size-budget.used)
     else:budget.release(budget.used-size)
     return fold
+
+
+def _fold_uncached(engine,scope,dimension,budget):
+    groups={};total=Totals();sessions=processed=0
+    budget.reserve(sys.getsizeof(groups)+total.retained_bytes())
+    progress=getattr(engine,'progress',None)
+    if progress:progress('aggregate')
+    for state,lo,hi in engine.call_ranges(scope):
+        owner_totals={};owner_bytes=sys.getsizeof(owner_totals)
+        budget.reserve(owner_bytes)
+        after=None
+        while True:
+            page=engine.snapshot.projected_calls(state['owner'],FIELDS,start=lo,end=hi,after=after,filters=scope)
+            engine.read_metrics['category_projection_rows']=engine.read_metrics.get('category_projection_rows',0)+len(page.rows)
+            for row in page.rows:
+                processed+=1
+                if not matches(row,scope):continue
+                key=group_key(row,dimension)
+                if key not in groups:
+                    label=(row.get('project_name') or key[0]) if dimension=='project' else key[0]
+                    _new_group(groups,key,label,budget)
+                if key not in owner_totals:
+                    owner_total=Totals()
+                    weight=256+_size(key)+owner_total.retained_bytes()
+                    budget.reserve(weight);owner_bytes+=weight
+                    owner_totals[key]=owner_total
+                owner_total=owner_totals[key]
+                before=owner_total.retained_bytes();accepted=owner_total.add(row)
+                change=owner_total.retained_bytes()-before
+                if change>0:budget.reserve(change)
+                else:budget.release(-change)
+                owner_bytes+=change
+                groups[key][1].observe(accepted,budget)
+            complete=page.complete;after=page.after
+            del page
+            if progress:progress(dict(stage='aggregate',processed=processed,unit='calls'))
+            if complete:break
+        if owner_totals:
+            sessions+=1
+            for key,owner_total in owner_totals.items():
+                value=groups[key][1]
+                before=value.totals.retained_bytes()+total.retained_bytes()
+                value.totals.merge(owner_total);total.merge(owner_total)
+                change=value.totals.retained_bytes()+total.retained_bytes()-before
+                if change>0:budget.reserve(change)
+                else:budget.release(-change)
+            del key,owner_total
+        del owner_totals
+        budget.release(owner_bytes)
+    engine.read_metrics['comparison_reused_calls']=0
+    budget.reserve(_tuple_bytes(2)+_tuple_bytes(3)+_tuple_bytes(1))
+    return _finish_fold(((key,(label,value.totals,(value,))) for key,(label,value) in groups.items()),
+                        len(groups),total,sessions,budget)
 
 
 def _name_key(key):
@@ -506,10 +571,17 @@ def project(engine,q):
     now=q.get('now',q['end'])
     reusable=(previous and previous['signature']==signature and now<previous['expires']
               and q['end']>=previous['end'])
-    budget=_Budget(min(LIMIT,engine.reader.limits.page_objects_bytes) if hasattr(engine,'reader') else LIMIT)
+    maximum=min(LIMIT,engine.reader.limits.page_objects_bytes) if hasattr(engine,'reader') else LIMIT
+    budget=_Budget(maximum,exhausted=_OwnerCacheUnavailable if hasattr(engine,'snapshot') else CapacityExceeded)
+    result_budget=_Budget(maximum);fallback=False
     if hasattr(engine,'snapshot'):
         with engine.read_scope():
-            entries=_owner_data(engine,scope,dimension,previous['entries'] if reusable else {},budget)
+            try:entries=_owner_data(engine,scope,dimension,previous['entries'] if reusable else {},budget)
+            except _OwnerCacheUnavailable:entries=None
+            if entries is None:
+                fallback=True
+                fold=_fold_uncached(engine,scope,dimension,result_budget)
+                entries={}
     else:
         entries={}
         for index,(state,lo,hi) in enumerate(engine.call_ranges(scope)):
@@ -518,22 +590,23 @@ def project(engine,q):
                 if matches(row,scope):add_row(groups,row,dimension,budget)
             for _,value in groups.values():value.compact(budget)
             entries[index]=dict(groups=groups)
-    result_budget=_Budget(budget.maximum)
-    fold=(previous.get('fold') if reusable and _same_population(previous['entries'],entries) else None)
-    if fold is None:fold=_fold(entries,result_budget)
-    else:result_budget.reserve(_size(fold))
+    if not fallback:
+        fold=(previous.get('fold') if reusable and _same_population(previous['entries'],entries) else None)
+        if fold is None:fold=_fold(entries,result_budget)
+        else:result_budget.reserve(_size(fold))
     data=_deliver(fold,scope,dimension,q['usage'])
     result_size=_size(data)
-    if result_size>budget.maximum:raise CapacityExceeded('comparison result exceeds delivered object budget')
+    if result_size>maximum:raise CapacityExceeded('comparison result exceeds delivered object budget')
     expires=expiry(engine,q)
     if hasattr(engine,'snapshot'):
         cache=dict(signature=signature,entries=entries,expires=expires,end=q['end'])
-        fold_weight=64+_size('fold')+_size(fold)
-        if budget.used+fold_weight<=budget.maximum:
-            budget.reserve(fold_weight);cache['fold']=fold
+        if not fallback:
+            fold_weight=64+_size('fold')+_size(fold)
+            if budget.used+fold_weight<=maximum:
+                budget.reserve(fold_weight);cache['fold']=fold
         engine._comparison_cache=cache
     if hasattr(engine,'read_metrics'):
-        engine.read_metrics['comparison_cache_bytes']=budget.used
+        engine.read_metrics['comparison_cache_bytes']=0 if fallback else budget.used
         engine.read_metrics['comparison_working_bytes']=result_budget.used
         engine.read_metrics['comparison_working_peak_bytes']=result_budget.peak
         engine.read_metrics['comparison_result_bytes']=result_size

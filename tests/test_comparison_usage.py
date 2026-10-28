@@ -686,6 +686,11 @@ def test_owner_cache_overflow_falls_back_with_exact_cold_warm_append_and_correct
     assert owner_bytes<allowance<reference.read_metrics['comparison_cache_bytes']
     del groups,reference
     engine=ProjectedEngine(deepcopy(owners));engine.reader.limits.page_objects_bytes=allowance
+    projected=engine.projected_calls;reads=[0]
+    def read_page(*args,**kwargs):
+        page=projected(*args,**kwargs);reads[0]+=len(page.rows)
+        return page
+    engine.projected_calls=read_page
     owner=('home','0')
     for phase in ('cold','warm','append','correction','removal'):
         if phase=='append':
@@ -697,12 +702,31 @@ def test_owner_cache_overflow_falls_back_with_exact_cold_warm_append_and_correct
         elif phase=='removal':
             engine.owners.pop(('home','1'));engine.revision+=1
         expected=project(ProjectedEngine(deepcopy(engine.owners)),q)
+        before=engine.read_metrics.get('category_projection_rows',0);read_before=reads[0]
         actual=project(engine,q)
+        assert engine.read_metrics['category_projection_rows']-before==reads[0]-read_before
+        assert reads[0]-read_before>actual['analysis']['response_count']
         assert exact_scalars(actual['usage'])==exact_scalars(expected['usage']),phase
         assert actual['analysis']==expected['analysis'],phase
         assert engine.read_metrics['comparison_cache_bytes']<=allowance
         assert engine.read_metrics['comparison_working_peak_bytes']<=allowance
         assert engine.read_metrics['comparison_result_bytes']<=allowance
+
+
+def test_required_projected_page_failure_does_not_retry_or_replace_cache(monkeypatch):
+    from cachemonitor.prepared_store import CapacityExceeded
+    engine=ProjectedEngine({('home','one'):[scalar_call(1)]})
+    accepted=project(engine,all_query());published=engine._comparison_cache
+    engine.replace(('home','one'),[scalar_call(2)])
+    reads=[]
+    def unavailable(*args,**kwargs):
+        reads.append(args)
+        raise CapacityExceeded('required projection unavailable')
+    monkeypatch.setattr(engine,'projected_calls',unavailable)
+    with pytest.raises(CapacityExceeded,match='required projection unavailable'):
+        project(engine,all_query())
+    assert len(reads)==1 and engine._comparison_cache is published
+    assert accepted['usage']['summary']['value']==1
 
 
 @pytest.mark.extended
