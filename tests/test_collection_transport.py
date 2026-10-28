@@ -1612,3 +1612,104 @@ def test_real_default_membership_growth_exceeds_old_full_header_limits(tmp_path)
         assert reader.read_header()['catalog_complete']
         assert reader.read(shared=True)==value
     finally:status.close();reader.close();writer.close()
+
+
+@pytest.mark.parametrize('present',[False,True])
+def test_paged_membership_distinguishes_absent_and_empty_source_sections(tmp_path,present):
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=snapshot(writer)
+        if present:value.update(session_catalog=[],demand_members=[])
+        writer.publish(value,'epoch',1)
+        page=reader.read_catalog(source='live')
+        assert page['membership_format']=='paged-v1'
+        assert page['membership']==({'session_catalog':[],'demand_members':[]} if present else {})
+        assert page['cursor'] is None and page['membership_complete']
+        assert list(page['owners'])==[(writer.homes[0],'session')]
+    finally:reader.close();writer.close()
+
+
+def test_catalog_legacy_peer_retains_membership_during_selected_body_read(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection
+    monkeypatch.setattr(collection,'CATALOG_PAGE_ROWS',1)
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    original=writer.live.catalog_request
+    def older(current,request):
+        return original(current,{key:item for key,item in request.items() if key!='membership_format'})
+    monkeypatch.setattr(writer.live,'catalog_request',older)
+    try:
+        value=membership_snapshot(writer,count=2,width=10)
+        value['sessions'].append(dict(value['sessions'][0],id=value['session_catalog'][1][1]))
+        writer.publish(value,'epoch',1)
+        first=reader.read_catalog(source='live')
+        assert 'membership' not in first and 'membership_format' not in first
+        assert first['header']['session_catalog']==value['session_catalog']
+        second=reader.read_catalog(source='live',cursor=first['cursor'])
+        assert second['cursor'] is None and 'membership' not in second
+        assert second['header']['demand_members']==value['demand_members']
+        key=next(iter(first['owners']))
+        selected=reader.read_owners([key],catalog=first)
+        assert selected['sessions']==value['sessions'][:1]
+        assert selected['catalog']['header']['session_catalog']==value['session_catalog']
+        assert selected['catalog']['header']['demand_members']==value['demand_members']
+    finally:reader.close();writer.close()
+
+
+def test_paged_catalog_rejects_membership_layout_change_during_traversal(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection
+    monkeypatch.setattr(collection,'CATALOG_PAGE_ROWS',1)
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes,writer.path)
+    try:
+        value=membership_snapshot(writer,count=2,width=10)
+        writer.publish(value,'epoch',1)
+        page=reader.read_catalog(source='live')
+        original=writer.live.catalog_request
+        def older(current,request):
+            return original(current,{key:item for key,item in request.items() if key!='membership_format'})
+        monkeypatch.setattr(writer.live,'catalog_request',older)
+        with pytest.raises(collection.CollectionCatalogUnavailable,match='membership_format'):
+            reader.read_catalog(source='live',cursor=page['cursor'])
+    finally:reader.close();writer.close()
+
+
+def test_catalog_scan_budget_includes_filtered_owner_positions(tmp_path,monkeypatch):
+    from cachemonitor import usage_collection as collection
+    monkeypatch.setattr(collection,'CATALOG_PAGE_ROWS',1)
+    writer=CollectionChannel([tmp_path/'one',tmp_path/'two'],tmp_path/'index.sqlite');writer.start_live()
+    reader=CollectionChannel(writer.homes[:1],writer.path)
+    try:
+        value=snapshot(writer)
+        value['sessions']=[dict(value['sessions'][0],home=writer.homes[1],id='filtered'),value['sessions'][0]]
+        value.update(session_catalog=[[writer.homes[1],'unloaded',None]],demand_members=[])
+        writer.publish(value,'epoch',1)
+        first=reader.read_catalog(source='live')
+        assert first['membership']['session_catalog']==value['session_catalog'] and first['owners']=={}
+        filtered=reader.read_catalog(source='live',cursor=first['cursor'])
+        assert filtered['membership']=={'session_catalog':[],'demand_members':[]} and filtered['owners']=={}
+        assert filtered['cursor'] is not None and filtered['membership_complete']
+        selected=reader.read_catalog(source='live',cursor=filtered['cursor'])
+        assert selected['cursor'] is None and list(selected['owners'])==[(writer.homes[0],'session')]
+    finally:reader.close();writer.close()
+
+
+@pytest.mark.parametrize('suffix',[b'\0'*70000,b'\0'*70000+b'invalid'])
+def test_durable_status_validates_padding_after_the_zlib_stream(tmp_path,suffix):
+    import zlib
+    from cachemonitor import usage_collection as collection
+    writer=CollectionChannel([tmp_path/'home'],tmp_path/'index.sqlite')
+    reader=collection.CollectionHeaderReader(writer.homes,writer.path)
+    try:
+        value=snapshot(writer)
+        writer.publish(value,'epoch',1)
+        raw=json.dumps(value,ensure_ascii=False).encode()
+        with writer.db:
+            writer.db.execute('UPDATE snapshot SET payload=? WHERE id=1',(zlib.compress(raw)+suffix,))
+        if suffix.endswith(b'invalid'):
+            with pytest.raises(collection.CollectionScopeError):reader.read_header()
+        else:
+            assert reader.read_header()['index']==value['index']
+            assert 'sessions' not in reader.header
+    finally:reader.close();writer.close()

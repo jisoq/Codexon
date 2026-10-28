@@ -36,7 +36,6 @@ class CollectionCatalogUnavailable(CollectionPending):
 CATALOG_PROTOCOL=6
 CATALOG_PAGE_ROWS=4096
 CATALOG_PAGE_BYTES=4*1024*1024
-CATALOG_HEADER_BYTES=1024*1024
 CATALOG_OWNER_BYTES=16*1024
 CATALOG_METADATA_BYTES=16*1024*1024
 SELECTED_OWNER_ROWS=16
@@ -48,6 +47,8 @@ OWNER_FIELDS=('home','id','title','model','provider','cwd','project','project_id
 # Optional captured compatibility values share the existing metadata/page
 # admission. Countdown-only changes do not change the committed catalog identity.
 CATALOG_STATE=('collection_complete','status','totals','remaining')
+STATUS_FIELDS=('ts','last_usage_collection_success','index','collection','collection_schema','homes',
+               'usage_collection_complete','catalog_complete','collection_fault','usage_errors','errors')
 
 
 def _catalog_weight(value,budget):
@@ -248,9 +249,13 @@ class LiveCollection:
             proof=(old.get('analysis_proof') if old is not None and old['body_digest']==saved[3]
                    else analysis_proof(session))
             if proof is not None:
-                proof_bytes=_catalog_weight(proof,CATALOG_OWNER_BYTES)
-                if proof_bytes>metadata_remaining:proof=None
-                else:metadata_remaining-=proof_bytes
+                try:proof_bytes=_catalog_weight(proof,CATALOG_OWNER_BYTES)
+                except ValueError as error:
+                    if str(error)!='catalog_metadata_budget':raise
+                    proof=None
+                else:
+                    if proof_bytes>metadata_remaining:proof=None
+                    else:metadata_remaining-=proof_bytes
             if old is not None and old['revision']==saved[0] and old['state']==state:
                 entry=(old if old.get('owner_metadata')==metadata and old.get('owner_lineage')==lineage and old.get('analysis_proof')==proof else
                        {**old,'owner_metadata':metadata,'owner_metadata_bytes':metadata_bytes,
@@ -370,7 +375,9 @@ class LiveCollection:
                 finally:self.waiters.discard(client)
         if value.get('close') or value.get('lease_only'):return dict(ready=current is not None),b''
         if current is None:return dict(ready=False),b''
-        if value.get('header_only'):return dict(ready=True,header=current['header'],publication=current['publication']),b''
+        if value.get('header_only'):
+            header={key:item for key,item in current['header'].items() if key in STATUS_FIELDS}
+            return dict(ready=True,header=header,publication=current['publication']),b''
         if value.get('protocol')==CATALOG_PROTOCOL:return self.catalog_request(current,value)
         # Older clients can still use the unchanged durable SQLite schema.
         protocol=value.get('protocol')
@@ -414,7 +421,7 @@ class LiveCollection:
                     **(dict(full=full) if protocol in (4,5) else {})),b''.join(chunks)
 
     def catalog_request(self,current,value):
-        """Slice the existing immutable manifest; never populate another catalog."""
+        """Slice the existing immutable publication; never populate another catalog."""
         publication=current['publication'];committed=current.get('catalog_identity')
         base=dict(protocol=CATALOG_PROTOCOL,publication=publication,catalog_identity=committed)
         def fail(reason):return dict(base,ready=False,error=reason),b''
@@ -427,7 +434,7 @@ class LiveCollection:
         if not isinstance(homes,list) or any(not isinstance(home,str) for home in homes):return fail('scope')
         allowed=set(homes);kind=value.get('read')
         try:
-            header=current['header'];_catalog_weight(header,CATALOG_HEADER_BYTES)
+            header=current['header']
             complete=bool(header.get('catalog_complete',header.get('usage_collection_complete') and not header.get('index',{}).get('loading'))
                           and allowed.issubset(header.get('homes',[])))
             if kind=='catalog':
@@ -436,36 +443,52 @@ class LiveCollection:
                 include=bool(value.get('include_metadata'));entries=[];home_ids={home:position for position,home in enumerate(homes)}
                 metadata_kind=value.get('metadata_kind','full')
                 if metadata_kind not in ('full','lineage'):return fail('metadata_kind')
+                membership_format=value.get('membership_format')
+                if membership_format not in (None,'paged-v1'):return fail('membership_format')
+                paged=membership_format=='paged-v1'
+                membership={key:[] for key in ('session_catalog','demand_members') if key in header} if paged else None
+                projected={key:item for key,item in header.items() if key not in ('session_catalog','demand_members')} if paged else header
                 metadata_field='owner_lineage' if metadata_kind=='lineage' else 'owner_metadata'
-                result=dict(base,ready=True,header=header,selected_homes=homes,membership_complete=complete,
-                            owner_format='refs-v1',include_metadata=include,metadata_kind=metadata_kind,owners=[],next_offset=None)
-                # During source recovery, analysis needs freshness but cannot
-                # use or withdraw incomplete membership. Avoid encoding owners
-                # that the consumer would immediately discard.
+                result=dict(base,ready=True,header=projected,selected_homes=homes,membership_complete=complete,
+                            owner_format='refs-v1',include_metadata=include,metadata_kind=metadata_kind,owners=entries,next_offset=None)
+                if paged:result.update(membership_format=membership_format,membership=membership)
+                # Source recovery cannot establish or withdraw membership.
                 if value.get('defer_incomplete') and not complete and not offset:
                     _catalog_weight(result,CATALOG_PAGE_BYTES)
                     return result,b''
                 manifest=current['envelope']['sessions']
-                if offset>len(manifest):return fail('cursor')
-                remaining=CATALOG_PAGE_BYTES-_catalog_weight(result,CATALOG_PAGE_BYTES);end=offset
-                for position in range(offset,min(len(manifest),offset+CATALOG_PAGE_ROWS)):
-                    entry=manifest[position]
-                    end=position+1
-                    if entry['home'] not in allowed:continue
-                    row=[home_ids[entry['home']],entry['sid'],entry['revision'],entry['body_digest'],
-                         [[index,entry['state'][key]] for index,key in enumerate(CATALOG_STATE) if key in entry['state']],
-                         entry.get(metadata_field) is not None]
-                    if include:
-                        envelope=entry.get(metadata_field)
-                        if metadata_kind=='lineage' and envelope is not None and entry.get('analysis_proof') is not None:
-                            envelope=dict(envelope,_analysis_proof=entry['analysis_proof'])
-                        row.append(envelope)
-                    weight=_catalog_weight(row,CATALOG_PAGE_BYTES)+32
-                    if weight>remaining:
-                        if not entries:return fail('catalog_entry_budget')
-                        end=position;break
-                    entries.append(row);remaining-=weight
-                result.update(owners=entries,next_offset=end if end<len(manifest) else None)
+                sections=[(key,header.get(key,())) for key in ('session_catalog','demand_members')] if paged else []
+                sections.append(('owners',manifest))
+                total=sum(len(rows) for _,rows in sections)
+                if offset>total:return fail('cursor')
+                remaining=CATALOG_PAGE_BYTES-_catalog_weight(result,CATALOG_PAGE_BYTES);end=offset;start=0
+                for section,rows in sections:
+                    stop=start+len(rows)
+                    for position in range(max(start,offset),min(stop,offset+CATALOG_PAGE_ROWS)):
+                        source=rows[position-start];end=position+1
+                        if section=='owners':
+                            if source['home'] not in allowed:continue
+                            row=[home_ids[source['home']],source['sid'],source['revision'],source['body_digest'],
+                                 [[index,source['state'][key]] for index,key in enumerate(CATALOG_STATE) if key in source['state']],
+                                 source.get(metadata_field) is not None]
+                            if include:
+                                envelope=source.get(metadata_field)
+                                if metadata_kind=='lineage' and envelope is not None and source.get('analysis_proof') is not None:
+                                    envelope=dict(envelope,_analysis_proof=source['analysis_proof'])
+                                row.append(envelope)
+                            target=entries
+                        else:row=source;target=membership[section]
+                        weight=_catalog_weight(row,CATALOG_PAGE_BYTES)+32
+                        if weight>remaining:
+                            if not entries and not (paged and any(membership.values())):return fail('catalog_entry_budget')
+                            end=position
+                            break
+                        target.append(row);remaining-=weight
+                    else:
+                        start=stop
+                        continue
+                    break
+                result['next_offset']=end if end<total else None
                 _catalog_weight(result,CATALOG_PAGE_BYTES)
                 return result,b''
             if kind=='append':
@@ -499,13 +522,13 @@ class LiveCollection:
                         not all(isinstance(part,str) for part in key) for key in requested)):return fail('request')
             keys=[tuple(key) for key in requested]
             if len(set(keys))!=len(keys) or any(key[0] not in allowed for key in keys):return fail('scope')
-            # Validate publication, membership and every byte length before copying
-            # any payload. A request never returns only an unannounced subset.
+            # Admit the complete selected transfer before copying any payload.
             if any(key not in current['entries'] for key in keys):return fail('missing')
             total=sum(len(current['sessions'][key][2]) for key in keys)
             if total>SELECTED_BODY_BYTES:return fail('body_budget')
             entries=[{**current['entries'][key],'size':len(current['sessions'][key][2])} for key in keys]
-            result=dict(base,ready=True,header=header,selected_homes=homes,membership_complete=complete,owners=entries)
+            projected={key:item for key,item in header.items() if key not in ('session_catalog','demand_members')}
+            result=dict(base,ready=True,header=projected,selected_homes=homes,membership_complete=complete,owners=entries)
             _catalog_weight(result,CATALOG_PAGE_BYTES)
             return result,b''.join(current['sessions'][key][2] for key in keys)
         except ValueError as error:return fail(str(error))
@@ -557,12 +580,12 @@ class CollectionHeaderReader:
         if (self.header is not None and self.publication and publication
                 and publication[0]==self.publication[0] and publication[1]<self.publication[1]):
             return self.header
-        self.header={key:value for key,value in header.items()
-                     if key not in ('sessions','request_activity','session_manifest','collection_schema')}
+        self.header={key:value for key,value in header.items() if key in STATUS_FIELDS and key!='collection_schema'}
         self.publication=publication
         return self.header
 
     def read_header(self):
+        self.last_read_live=False
         for protocol in (5,4,3):
             response=self.live_request(header_only=True,protocol=protocol,activity_stream=True)
             if response is None:break
@@ -572,19 +595,16 @@ class CollectionHeaderReader:
                 self.last_read_live=True
                 return self.accept_header(metadata['header'],metadata.get('publication'))
         if not self.snapshot_path.exists():return None
+        from .collection_stream import snapshot_status
         with closing(sqlite3.connect(self.snapshot_path.as_uri()+'?mode=ro',uri=True,timeout=1)) as db:
             db.execute('BEGIN')
-            row=db.execute('SELECT scope,epoch,sequence,length(payload) FROM snapshot WHERE id=1').fetchone()
+            row=db.execute('SELECT scope,epoch,sequence FROM snapshot WHERE id=1').fetchone()
             if not row:return None
             if row[0]!=self.scope:raise CollectionScopeError('수집 결과의 관측 범위가 일치하지 않습니다.')
             publication=(row[1],row[2])
             if self.header is not None and self.publication and publication[0]==self.publication[0] and publication[1]<=self.publication[1]:
                 return self.header
-            if row[3]>CATALOG_PAGE_BYTES:raise ValueError('Collection header exceeds read budget')
-            payload=db.execute('SELECT payload FROM snapshot WHERE id=1').fetchone()[0]
-            decoder=zlib.decompressobj();decoded=decoder.decompress(payload,2*CATALOG_PAGE_BYTES+1)
-            if len(decoded)>2*CATALOG_PAGE_BYTES or not decoder.eof:raise ValueError('Collection header exceeds read budget')
-            return self.accept_header(json.loads(decoded),publication)
+            return self.accept_header(snapshot_status(db),publication)
 
     def close(self):
         if self.last_read_live:self.live_request(close=True)
@@ -834,7 +854,11 @@ class CollectionChannel(CollectionHeaderReader):
             self.live.publish(candidate)
 
     def read_header(self):
-        return self.read(header_only=True)
+        header=super().read_header()
+        if (self.live_cached is not None and (header is None or self.publication and self.live_publication
+                and self.publication[0]==self.live_publication[0] and self.publication[1]<self.live_publication[1])):
+            return self.accept_header(self.live_cached,self.live_publication)
+        return header
 
     def activity_page(self,result,epoch,*,live=False):
         if not result.get('activity_stream'):return result
@@ -1018,21 +1042,31 @@ class CollectionChannel(CollectionHeaderReader):
             raise CollectionScopeError('수집 목록의 범위가 일치하지 않습니다.')
         return dict(catalog_identity=value['catalog_identity'])
 
-    def read_catalog(self,*,source='durable',cursor=None,include_metadata=None,defer_incomplete=False,metadata_kind=None):
+    def read_catalog(self,*,source='durable',cursor=None,include_metadata=None,defer_incomplete=False,metadata_kind=None,
+                     membership_format='paged-v1'):
         """Return owner references without decoding their call history."""
         if source=='live':
             token=self._catalog_token(cursor) if cursor is not None else {}
             include=(cursor['include_metadata'] if cursor is not None else False) if include_metadata is None else bool(include_metadata)
             requested_kind=(cursor.get('metadata_kind','full') if cursor is not None else 'full') if metadata_kind is None else metadata_kind
             if requested_kind not in ('full','lineage'):raise ValueError('Unsupported catalog metadata kind')
+            requested_format=cursor.get('membership_format') if cursor is not None else membership_format
+            if requested_format not in (None,'paged-v1'):raise ValueError('Unsupported catalog membership format')
             metadata,body=self._catalog_request(read='catalog',offset=cursor['offset'] if cursor is not None else 0,
-                                               include_metadata=include,defer_incomplete=bool(defer_incomplete),metadata_kind=requested_kind,**token)
+                                               include_metadata=include,defer_incomplete=bool(defer_incomplete),metadata_kind=requested_kind,
+                                               membership_format=requested_format,**token)
             if body:raise CollectionScopeError('수집 목록에 예상하지 않은 본문이 있습니다.')
             publication=tuple(metadata['publication']);committed=tuple(metadata['catalog_identity'])
             if token and committed!=tuple(token['catalog_identity']):
                 raise CollectionCatalogUnavailable('stale')
             base=dict(source='live',scope=self.scope,path=str(self.path),selected_homes=list(self.homes),
                       publication=publication,catalog_identity=committed,include_metadata=include,metadata_kind=requested_kind)
+            returned_format=metadata.get('membership_format')
+            if returned_format not in (None,'paged-v1') or returned_format is not None and returned_format!=requested_format:
+                raise CollectionCatalogUnavailable('membership_format')
+            if cursor is not None and returned_format!=cursor.get('membership_format'):
+                raise CollectionCatalogUnavailable('membership_format')
+            if returned_format is not None:base['membership_format']=returned_format
             returned_kind=metadata.get('metadata_kind','full')
             if returned_kind not in ('full','lineage') or returned_kind=='lineage' and requested_kind!='lineage':
                 raise CollectionScopeError('Unexpected catalog metadata kind')
@@ -1054,9 +1088,15 @@ class CollectionChannel(CollectionHeaderReader):
                             entry.update(analysis_digest=proof['digest'],display_title=proof['title'],append_context=proof['context'])
                     else:entry['owner_metadata']=row[6]
                 owners[(home,row[1])]=entry
-            return dict(base,header=metadata['header'],membership_complete=metadata['membership_complete'],
-                owners=owners,
-                cursor={**base,'offset':next_offset} if next_offset is not None else None)
+            result=dict(base,header=metadata['header'],membership_complete=metadata['membership_complete'],owners=owners,
+                        cursor={**base,'offset':next_offset} if next_offset is not None else None)
+            if returned_format is not None:
+                membership=metadata.get('membership')
+                if (not isinstance(membership,dict) or set(membership)-{'session_catalog','demand_members'}
+                        or any(not isinstance(rows,list) for rows in membership.values())):
+                    raise CollectionScopeError('수집 목록의 멤버십 형식이 일치하지 않습니다.')
+                result['membership']=membership
+            return result
         if source!='durable' or cursor is not None:raise ValueError('Unsupported collection catalog source')
         result=self.read_owners(())
         return result['catalog'] if result is not None else None
@@ -1109,7 +1149,7 @@ class CollectionChannel(CollectionHeaderReader):
         metadata,body=self._catalog_request(read='owners',owners=keys,**token)
         if tuple(metadata['catalog_identity'])!=tuple(token['catalog_identity']):
             raise CollectionCatalogUnavailable('stale')
-        catalog={**catalog,'publication':tuple(metadata['publication']),'header':metadata['header']}
+        catalog={**catalog,'publication':tuple(metadata['publication']),'header':{**catalog['header'],**metadata['header']}}
         entries=metadata['owners']
         if [(entry['home'],entry['sid']) for entry in entries]!=keys:
             raise CollectionScopeError('수집 목록의 선택 세션이 일치하지 않습니다.')
@@ -1436,11 +1476,12 @@ class CollectionClient:
                                     self.channel.catalog_identity)
         return snapshot
 
-    def poll_catalog(self,now=None,*,cursor=None,include_metadata=None,defer_incomplete=False,metadata_kind=None):
+    def poll_catalog(self,now=None,*,cursor=None,include_metadata=None,defer_incomplete=False,metadata_kind=None,
+                     membership_format='paged-v1'):
         """One live metadata page; callers stage pages before replacing membership."""
         now=time.time() if now is None else now
         catalog=self.channel.read_catalog(source='live',cursor=cursor,include_metadata=include_metadata,
-                                          defer_incomplete=defer_incomplete,metadata_kind=metadata_kind)
+                                          defer_incomplete=defer_incomplete,metadata_kind=metadata_kind,membership_format=membership_format)
         header={**catalog['header']};homes=set(self.channel.homes)
         header['quota_by_home']={home:quota for home,quota in header.get('quota_by_home',{}).items() if home in homes}
         stale=now-header['ts']>30
