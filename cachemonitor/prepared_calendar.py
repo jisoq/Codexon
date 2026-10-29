@@ -102,7 +102,7 @@ def population(bucket, group, metric, start, end, inclusive):
         reserve(512)
         values, owners, samples = [], {}, []
         outputs, seconds, calls = [], [], 0
-        for block, position, _ in bucket.window.entries(start, end, inclusive, scopes):
+        for block, position, _ in bucket.window.entries(start, end, inclusive, scopes, start, end):
             calls += 1;owner = block.owners[position]
             if owner not in owners:
                 reserve(_size(owner) + 480)
