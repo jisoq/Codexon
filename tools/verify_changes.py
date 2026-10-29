@@ -39,6 +39,9 @@ def test_nodes(module, *names):
 
 
 GROUPS = {
+    'overlay_benchmark': test_files('benchmark_overlay_latency') + test_nodes('collection_transport',
+        'test_benchmark_trace_instances_keep_concurrent_records_complete',
+        'test_benchmark_watcher_keeps_activity_until_owner_replay_finishes'),
     'mismatch_data': test_files('mismatch_history', 'mismatch_source'),
     'mismatch_ui': test_files('mismatch_page', 'mismatch_bridge'),
     'native_cpu': test_files('native_cpu', 'native_trends', 'native_usage', 'native_quota_series', 'native_index', 'native_analysis', 'build_native'),
@@ -129,6 +132,9 @@ RULES = (
     ('tools/build_native.py', ('native_cpu', 'payload')),
     ('tools/benchmark_cpu.py', ('native_cpu',)),
     ('tools/benchmark_analysis.py', ('prepared', 'performance_trends')),
+    ('tools/benchmark_cumulative.py', ('analysis', 'prepared', 'performance_trends')),
+    ('tools/benchmark_overlay_latency.py', ('overlay_benchmark',)),
+    ('tools/benchmark_overlay_worker.py', ('overlay_benchmark',)),
     ('tools/benchmark_prepared_speed.py', ('prepared', 'speed')),
     ('cachemonitor/performance_trends.py', ('performance_trends', 'native_cpu', 'prepared')),
     ("cachemonitor/performance_*.py", ("performance_trends",)),

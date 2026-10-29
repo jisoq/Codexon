@@ -95,12 +95,10 @@ class PreparedQuery:
             progress=message.get('_progress')
             if progress:progress('query')
             engine=self._engine(token,cancellation,message.get('_prepared_changes',()))
-            from .analysis_worker import expiry
             engine.progress=progress
             try:
-                with engine.read_scope():
-                    result=engine.page_query(query)
-                    valid_until=result['valid_until'] if 'valid_until' in result else expiry(engine,query)
+                result=engine.page_query(query)
+                valid_until=result['valid_until']
             finally:
                 engine.progress=None
             result=dict(result,prepared_token=tuple_token(token))

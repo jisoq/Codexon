@@ -163,8 +163,14 @@ class PreparedAnalysisEngine(AnalysisEngine):
             return super().query(q)
 
     def page_query(self, q):
-        with self.read_scope():
+        if q.get('category_usage') and q.get('usage', {}).get('comparison'):
             return super().page_query(q)
+        with self.read_scope():
+            result = super().page_query(q)
+            if 'valid_until' not in result:
+                from .analysis_worker import expiry
+                result['valid_until'] = expiry(self, q)
+            return result
 
 
     def _pages(self, method, *args, **kwargs):

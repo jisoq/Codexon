@@ -64,6 +64,8 @@ class Numbers:
         self.large_bytes = 0
 
     def append(self, value):
+        before = getsizeof(self.bits) + getsizeof(self.tags)
+        growth = 0
         if not valid(value):
             tag, bits = 0, 0
         elif type(value) is float:
@@ -73,10 +75,14 @@ class Numbers:
         else:
             tag, bits = 3, 0
             position = len(self.tags)
+            size = getsizeof(self.large)
             self.large[position] = value
-            self.large_bytes += _size(position) + _size(value)
+            added = _size(position) + _size(value)
+            self.large_bytes += added
+            growth = getsizeof(self.large) - size + added
         self.bits.append(bits)
         self.tags.append(tag)
+        return getsizeof(self.bits) + getsizeof(self.tags) - before + growth
 
     def at(self, position):
         if position < 0:position += len(self.tags)
@@ -107,12 +113,20 @@ class Block:
         self.conflicts = bytearray()
 
     def append(self, row, scope):
-        if scope not in self.positions:self.positions[scope] = array('H')
-        self.positions[scope].append(len(self.owners))
+        growth = 0
+        if scope not in self.positions:
+            before = getsizeof(self.positions)
+            self.positions[scope] = array('H')
+            growth += getsizeof(self.positions) - before + getsizeof(scope) + getsizeof(self.positions[scope])
+        positions = self.positions[scope]
+        before = getsizeof(positions) + getsizeof(self.owners) + getsizeof(self.conflicts)
+        positions.append(len(self.owners))
         self.owners.append(row['_owner'])
         self.conflicts.append(bool(row.get('input_conflict')))
+        growth += getsizeof(positions) + getsizeof(self.owners) + getsizeof(self.conflicts) - before
         for name, values in self.values.items():
-            values.append(row.get(name))
+            growth += values.append(row.get(name))
+        return growth
 
     def size(self):
         return (getsizeof(self) + getsizeof(self.values) + getsizeof(self.owners) +
@@ -139,8 +153,7 @@ class Window:
                 self.tail_size = block.size();amount += self.tail_size + 16
             block = self.blocks[-1]
             before = self.tail_size
-            block.append(row, scope)
-            self.tail_size = block.size()
+            self.tail_size += block.append(row, scope)
             amount += self.tail_size - before
         finally:
             self.budget.add(amount - reserve)
@@ -150,22 +163,21 @@ class Window:
             block = self.blocks.popleft()
             self.budget.add(-block.size() - 16)
 
-    def entries(self, start, end, inclusive, scopes):
+    def entries(self, start, end, inclusive, scopes, support_start, support_end):
         for block in self.blocks:
             self.check()
             times=block.values['ts']
-            # Chronological blocks allow whole-block rejection and two seeks;
-            # do not decode every timestamp again for every displayed metric.
             if times.at(-1)<start:continue
             if times.at(0)>end or times.at(0)==end and not inclusive:break
             left=bisect_left(times,start)
             right=bisect_right(times,end) if inclusive else bisect_left(times,end)
+            support_left=bisect_left(times,support_start)
+            support_right=bisect_right(times,support_end)
             selected = [block.positions[scope] for scope in scopes if scope in block.positions]
             selected=[islice(indices,bisect_left(indices,left),bisect_left(indices,right)) for indices in selected]
             positions = selected[0] if len(selected) == 1 else merge(*selected)
             for position in positions:
-                stamp = block.values['ts'].at(position)
-                yield block, position, stamp
+                yield block, position, support_left <= position < support_right
 
 
 def _eligible(row, field):
@@ -201,26 +213,31 @@ class Group:
                 self.budget.add(_size(metric) + _size([0, 0, None, None]) + 96)
                 self.stats[metric] = [0, 0, None, None]
             stats = self.stats[metric]
-            # These fixed-length scalar lists do not change capacity. Charge
-            # only their cells' exact size changes, including arbitrary integers.
-            before = sum(map(getsizeof, stats))
+            before = getsizeof(stats[1])
             stats[1] += 1
+            change = getsizeof(stats[1]) - before
             if _eligible(row, field):
                 value = row[field]
+                before = getsizeof(stats[0])
                 stats[0] += 1
-                if stats[2] is None or value < stats[2]:stats[2] = value
-                if stats[3] is None or value > stats[3]:stats[3] = value
-            self.budget.add(sum(map(getsizeof, stats)) - before)
+                change += getsizeof(stats[0]) - before
+                if stats[2] is None or value < stats[2]:
+                    change += getsizeof(value) - getsizeof(stats[2]);stats[2] = value
+                if stats[3] is None or value > stats[3]:
+                    change += getsizeof(value) - getsizeof(stats[3]);stats[3] = value
+            self.budget.add(change)
         owner = row['_owner']
         if owner not in self.sessions:
             self.budget.add(_size(owner) + _size([0, 0, 0]) + 96)
             self.sessions[owner] = [0, 0, 0]
         totals = self.sessions[owner]
-        before = sum(map(getsizeof, totals))
+        change = 0
         if (valid(row.get('input')) and valid(row.get('cached')) and
                 row['cached'] <= row['input'] and not row.get('input_conflict')):
+            before = getsizeof(totals[0]) + getsizeof(totals[1]) + getsizeof(totals[2])
             totals[0] += row['input'];totals[1] += row['cached'];totals[2] += 1
-        self.budget.add(sum(map(getsizeof, totals)) - before)
+            change = getsizeof(totals[0]) + getsizeof(totals[1]) + getsizeof(totals[2]) - before
+        self.budget.add(change)
 
     def summary(self, metric):
         if metric == 'count':return self.count, self.count, None, None
@@ -252,61 +269,77 @@ class Group:
             self.budget.output(_size(cell) - before + (96 if before == 0 else 0))
 
 
-@contextmanager
-def population(entries, budget, metric, support_start, support_end):
-    """One metric's values and per-session totals; no retained call records."""
-    field = 'reasoning' if metric.startswith('reasoning:') else metric
-    with budget.scratch() as reserve:
-        reserve(512)
-        values, sessions = [], {}
-        calls = 0
-        support = metric == 'count'
-        numerator, seconds = _Sum(), _Sum()
-        for block, position, stamp in entries:
-            calls += 1
-            owner = block.owners[position]
-            if owner not in sessions:
-                reserve(_size(owner) + 240)
-                sessions[owner] = [0, 0, 0] if metric == 'session_cache' else None
-            if metric == 'count':continue
-            if metric == 'session_cache':
-                amount, cached = (block.values[name].at(position) for name in ('input', 'cached'))
-                if amount is None or cached is None or cached > amount or block.conflicts[position]:continue
-                totals = sessions[owner]
-                before = sum(map(getsizeof, totals))
-                totals[0] += amount;totals[1] += cached;totals[2] += 1
-                reserve(max(0, sum(map(getsizeof, totals)) - before))
-                if amount and support_start <= stamp <= support_end:support = True
-                continue
-            value = block.values[field].at(position)
-            if value is None:continue
-            if metric == 'output_speed':
-                output, elapsed = (block.values[name].at(position) for name in ('output', 'completion_latency_ms'))
-                if output is None or elapsed is None or elapsed <= 0:continue
-                numerator.add(output);seconds.add(elapsed / 1000)
-            reserve(_size(value) + 24)  # list capacity, sorted copy and Timsort scratch
-            values.append(value)
-            if support_start <= stamp <= support_end:support = True
-        if metric == 'session_cache':
-            amount, cached, valid_calls = _Sum(), _Sum(), 0
-            for own_input, own_cached, own_calls in sessions.values():
-                if not own_input:continue
-                value = 100 * own_cached / own_input
-                reserve(_size(value) + 24)
-                values.append(value)
-                amount.add(own_input);cached.add(own_cached);valid_calls += own_calls
-            total = len(sessions)
-            totals = dict(input=amount.value(), cached=cached.value(), valid_calls=valid_calls)
-        elif metric == 'output_speed':
-            total = calls;totals = dict(output=numerator.value(), seconds=seconds.value())
-        else:
-            total = calls;totals = dict(sum=calls if metric == 'count' else sum(values))
-        mean = (calls if metric == 'count' else
-                totals['output'] / totals['seconds'] if metric == 'output_speed' and totals['seconds'] else
-                None if metric == 'output_speed' else sum(values) / len(values) if values else None)
-        yield dict(eligible=calls if metric == 'count' else len(values), total=total, totals=totals,
-                   distribution=distribution_statistics(values), mean=mean, support=support,
-                   sessions=len(sessions), calls=calls)
+def populations(members, budget, metrics, check):
+    saved_calls, saved_sessions = None, 0
+    for metric in metrics:
+        check()
+        field = 'reasoning' if metric.startswith('reasoning:') else metric
+        with budget.scratch() as reserve:
+            reserve(512)
+            values, sessions = [], {}
+            calls = 0 if saved_calls is None else saved_calls
+            collect_owners = saved_calls is None or metric == 'session_cache'
+            support = metric == 'count'
+            numerator, seconds = _Sum(), _Sum()
+            totals = None
+            try:
+                if metric != 'count' or saved_calls is None:
+                    for block, position, supported in members():
+                        if saved_calls is None:calls += 1
+                        if collect_owners:
+                            owner = block.owners[position]
+                            if owner not in sessions:
+                                reserve(_size(owner) + 240)
+                                sessions[owner] = [0, 0, 0] if metric == 'session_cache' else None
+                        if metric == 'count':continue
+                        if metric == 'session_cache':
+                            amount, cached = (block.values[name].at(position) for name in ('input', 'cached'))
+                            if amount is None or cached is None or cached > amount or block.conflicts[position]:continue
+                            totals = sessions[owner]
+                            before = sum(map(getsizeof, totals))
+                            totals[0] += amount;totals[1] += cached;totals[2] += 1
+                            reserve(max(0, sum(map(getsizeof, totals)) - before))
+                            if amount and supported:support = True
+                            continue
+                        value = block.values[field].at(position)
+                        if value is None:continue
+                        if metric == 'output_speed':
+                            output, elapsed = (block.values[name].at(position) for name in ('output', 'completion_latency_ms'))
+                            if output is None or elapsed is None or elapsed <= 0:continue
+                            numerator.add(output);seconds.add(elapsed / 1000)
+                        reserve(_size(value) + 24)
+                        values.append(value)
+                        if supported:support = True
+                session_count = len(sessions) if collect_owners else saved_sessions
+                if saved_calls is None:saved_calls, saved_sessions = calls, session_count
+                if metric == 'session_cache':
+                    amount, cached, valid_calls = _Sum(), _Sum(), 0
+                    for own_input, own_cached, own_calls in sessions.values():
+                        if not own_input:continue
+                        value = 100 * own_cached / own_input
+                        reserve(_size(value) + 24)
+                        values.append(value)
+                        amount.add(own_input);cached.add(own_cached);valid_calls += own_calls
+                    total = session_count
+                    totals = dict(input=amount.value(), cached=cached.value(), valid_calls=valid_calls)
+                elif metric == 'output_speed':
+                    total = calls;totals = dict(output=numerator.value(), seconds=seconds.value())
+                else:
+                    total = calls;totals = dict(sum=calls if metric == 'count' else sum(values))
+                mean = (calls if metric == 'count' else
+                        totals['output'] / totals['seconds'] if metric == 'output_speed' and totals['seconds'] else
+                        None if metric == 'output_speed' else sum(values) / len(values) if values else None)
+                check()
+                distribution = distribution_statistics(values)
+                check()
+                summary = dict(eligible=calls if metric == 'count' else len(values), total=total, totals=totals,
+                    distribution=distribution, mean=mean, support=support, sessions=session_count, calls=calls)
+            finally:
+                values.clear();sessions.clear()
+                totals = numerator = seconds = None
+        check()
+        yield metric, summary
+        del summary
 
 
 def point(metric, group, event, window, now, values):
@@ -374,14 +407,20 @@ def rolling(source, q, width, start, end, full, scopes):
                                   unit='intervals',calls=count))
                 upcoming = next(rows, None)
             for group in groups.values():
-                for metric, _, _ in specs:
-                    if (metric == 'count') != (event[0] == 'count'):continue
-                    if metric.startswith('reasoning:') and metric.split(':', 1)[1] not in group.efforts:continue
-                    selected = group.efforts[metric.split(':', 1)[1]] if metric.startswith('reasoning:') else group.scopes
-                    with population(window.entries(a, b, b == end, selected), budget, metric, support_a, support_b) as values:
-                        value = point(metric, group, event, duration, now, values)
+                metrics = (metric for metric, _, _ in METRICS) if event[0] == 'rolling' else ('count',)
+                members = lambda: window.entries(a, b, b == end, group.scopes, support_a, support_b)
+                for metric, values in populations(members, budget, metrics, window.check):
+                    value = point(metric, group, event, duration, now, values)
                     budget.output(_size(value) + 32)
                     group.points.setdefault(metric, {})[event[1]] = value
+                if event[0] == 'rolling':
+                    for effort in efforts:
+                        if effort not in group.efforts:continue
+                        members = lambda: window.entries(a, b, b == end, group.efforts[effort], support_a, support_b)
+                        for metric, values in populations(members, budget, ('reasoning:' + effort,), window.check):
+                            value = point(metric, group, event, duration, now, values)
+                            budget.output(_size(value) + 32)
+                            group.points.setdefault(metric, {})[event[1]] = value
             if event_index + 1 < len(events):window.discard(lefts[event_index + 1])
             if progress:progress(dict(stage='aggregate',processed=event_index+1,total=len(events),
                                       unit='intervals',calls=count))
@@ -453,25 +492,36 @@ def hour_of_day(source, q, start, end, full, scopes):
             for spec in panels:
                 metric=spec['key']
                 if metric.startswith('reasoning:') and metric.split(':',1)[1] not in group.efforts:continue
-                selected=group.efforts[metric.split(':',1)[1]] if metric.startswith('reasoning:') else group.scopes
                 eligible,total,low,high=group.summary(metric)
                 spec['n']+=eligible;spec['N']+=total
                 if low is not None:
                     spec['low']=min(spec['low'],low) if spec['low'] is not None else low
                     spec['high']=max(spec['high'],high) if spec['high'] is not None else high
-                points=[]
-                for hour in range(24):
-                    source.snapshot._check()
-                    def entries():
-                        for block in window.blocks:
-                            source.snapshot._check()
-                            for position in merge(*(block.positions.get((scope,hour),()) for scope in selected)):
-                                yield block,position,block.values['ts'].at(position)
-                    with population(entries(),budget,metric,start,end) as values:
-                        value=clock_point(metric,key[0],key[1],hour,values)
-                    budget.output(_size(value)+32);points.append(value)
-                line=dict(model=key[0],service_tier=key[1],points=points,coverage=(eligible,total))
+                line=dict(model=key[0],service_tier=key[1],points=[],coverage=(eligible,total))
                 budget.output(256);spec['lines'].append(line)
+            for hour in range(24):
+                source.snapshot._check()
+                def entries(selected):
+                    for block in window.blocks:
+                        source.snapshot._check()
+                        for position in merge(*(block.positions.get((scope,hour),()) for scope in selected)):
+                            yield block,position,True
+                ordinary = (spec['key'] for spec in panels if not spec['key'].startswith('reasoning:'))
+                members = lambda: entries(group.scopes)
+                for spec, (_, values) in zip(
+                        (spec for spec in panels if not spec['key'].startswith('reasoning:')),
+                        populations(members,budget,ordinary,window.check)):
+                    value=clock_point(spec['key'],key[0],key[1],hour,values)
+                    budget.output(_size(value)+32);spec['lines'][-1]['points'].append(value)
+                for spec in panels:
+                    metric=spec['key']
+                    if not metric.startswith('reasoning:'):continue
+                    effort=metric.split(':',1)[1]
+                    if effort not in group.efforts:continue
+                    members=lambda: entries(group.efforts[effort])
+                    for _,values in populations(members,budget,(metric,),window.check):
+                        value=clock_point(metric,key[0],key[1],hour,values)
+                        budget.output(_size(value)+32);spec['lines'][-1]['points'].append(value)
         finally:
             rows.close()
             del group,window

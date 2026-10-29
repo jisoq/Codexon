@@ -9,8 +9,9 @@ and upstream model generation are outside this claim.
 
 Run with the locked release interpreter through tools/run_ui_checks.py. Use a
 separate --profile run for cProfile and production wall/thread CPU stage records.
-The growth case requires a committed, incomplete conversion cohort. It
-then appends and collects new source rows before releasing that local test gate.
+Controlled overlap cases pause aggregate conversion or an executing comparison
+or trend query. Selected source changes must reach native painting before each
+local gate opens. These cases prove overlap and cancellation, not timing speedups.
 """
 from __future__ import annotations
 
@@ -33,128 +34,39 @@ import time
 import traceback
 import uuid
 
-ROOT = Path(__file__).resolve().parents[1]
+HARNESS_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(HARNESS_ROOT))
+from tools.benchmark_cumulative import query_shapes
+from tools.benchmark_overlay_worker import QueryOverlap, Trace, analysis_process, fingerprint
+
+CHECKOUT_PARSER = argparse.ArgumentParser(add_help=False)
+CHECKOUT_PARSER.add_argument('--checkout', type=Path)
+CHECKOUT_ARGS, _ = CHECKOUT_PARSER.parse_known_args()
+ROOT = Path(CHECKOUT_ARGS.checkout or os.environ.get('CODEXON_OVERLAY_BENCHMARK_CHECKOUT')
+            or Path(__file__).resolve().parents[1]).resolve()
 sys.path.insert(0, str(ROOT))
 
 
-class Trace:
-    lock = threading.Lock()
-
-    def __init__(self, path):
-        self.path = Path(path)
-
-    def emit(self, stage, **values):
-        row = dict(stage=stage, ns=time.perf_counter_ns(), pid=os.getpid(), **values)
-        with self.lock, self.path.open('a', encoding='utf-8') as output:
-            output.write(json.dumps(row, ensure_ascii=False) + '\n')
-        return row['ns']
-
-
-def fingerprint(data):
-    if not data:
-        return None
-    return [data.get('home'), data.get('id'), data.get('calls'), data.get('latest_key')]
-
-
-def analysis_process(connection, *args, trace_path, profile=False, entered=None, release=None):
-    from cachemonitor.analysis_worker import process_main
-    trace = Trace(trace_path)
-
-    class Connection:
-        def __getattr__(self, name):
-            return getattr(connection, name)
-
-        def send(self, value):
-            if value['kind'] == 'snapshot':
-                snapshot = value['value']
-                trace.emit('analysis_publication', token=snapshot.get('prepared_token'), source_at=snapshot.get('ts'),
-                           summaries=[fingerprint(s) for s in snapshot.get('overlay_sessions', [])],
-                           revisions={s['id']:s.get('_overlay_revision') for s in snapshot.get('overlay_sessions', [])})
-            elif value['kind'] in ('fatal', 'error', 'overlay_detail', 'stale'):
-                trace.emit('analysis_' + value['kind'], request=value.get('id'),
-                           summary=fingerprint(value.get('summary')), error=value.get('error'))
-            connection.send(value)
-
-    if entered is not None:
-        from cachemonitor.prepared_ingest import PreparedCohort
-        convert = PreparedCohort.convert
-
-        def gated(cohort, *values, **kwargs):
-            for change in convert(cohort, *values, **kwargs):
-                if not change['ready'] and not entered.is_set():
-                    ready = cohort.store.db.execute('SELECT ready FROM meta WHERE singleton=1').fetchone()[0]
-                    assert ready == 0, 'growth gate requires an incomplete durable publication'
-                    trace.emit('conversion_checkpoint', ready=ready,
-                               changed=len(change['changed']), writes=change['writes'])
-                    entered.set()
-                    if not release.wait(60):
-                        raise TimeoutError('source-growth gate was not released')
-                    trace.emit('conversion_released')
-                yield change
-        PreparedCohort.convert = gated
-    if profile:
-        import cProfile
-        from cachemonitor.quota_diagnostics import StageTimings
-        snapshot = StageTimings.snapshot
-
-        def stage_snapshot(timing, **kwargs):
-            value = snapshot(timing, **kwargs)
-            if kwargs.get('complete'):
-                trace.emit('cpu_stages', **value)
-            return value
-        StageTimings.snapshot = stage_snapshot
-        from cachemonitor.prepared_ingest import PreparedCohort
-        from cachemonitor.prepared_delivery import PreparedPublisher
-        sequence = [0]
-
-        def measure_method(owner, name):
-            original = getattr(owner, name)
-
-            def measured(instance, *values, **kwargs):
-                sequence[0] += 1
-                number = sequence[0]
-                profiler = cProfile.Profile()
-                try:
-                    return profiler.runcall(original, instance, *values, **kwargs)
-                finally:
-                    target = Path(trace_path).with_name(f'{Path(trace_path).stem}-{number:03d}-{name}.pstats')
-                    profiler.dump_stats(str(target))
-                    trace.emit('profile_saved', method=name, path=target.name)
-            setattr(owner, name, measured)
-        original_convert = PreparedCohort.convert
-
-        def profiled_convert(cohort, *values, **kwargs):
-            sequence[0] += 1
-            number = sequence[0]
-            profiler = cProfile.Profile()
-            iterator = iter(original_convert(cohort, *values, **kwargs))
-            try:
-                while True:
-                    try:
-                        value = profiler.runcall(next, iterator)
-                    except StopIteration:
-                        break
-                    yield value
-            finally:
-                iterator.close()
-                target = Path(trace_path).with_name(f'{Path(trace_path).stem}-{number:03d}-convert.pstats')
-                profiler.dump_stats(str(target))
-                trace.emit('profile_saved', method='convert', path=target.name,
-                           metrics=dict(cohort.metrics))
-        PreparedCohort.convert = profiled_convert
-        measure_method(PreparedPublisher, 'adopt')
-        measure_method(PreparedPublisher, 'publish')
-    process_main(Connection(), *args)
-
-
 def collector_process(connection, home, index, evidence, trace_path, profile, mode):
+    from cachemonitor.model_evidence import EvidenceStore
+    EvidenceStore(evidence).close()
     if mode == 'watcher':
         return watcher_process(connection, home, index, evidence, trace_path, profile)
-    from cachemonitor.usage_collection import CollectorService
+    from cachemonitor import usage_collection
+    from cachemonitor.collection_replay import EncodedSession
+    import zlib
+    CollectorService = usage_collection.CollectorService
     trace = Trace(trace_path)
+    module_path = Path(usage_collection.__file__).resolve()
+    assert module_path.parents[1] == ROOT, (module_path, ROOT)
+    trace.emit('product_import', role='collector', checkout=str(ROOT), module_path=str(module_path))
     service = None
     try:
         service = CollectorService([home], index, evidence)
+        ready = service.poll(detailed=False)
+        trace.emit('collector_ready', demand=ready.get('demand'),
+                   evidence_highwater=ready.get('activity_source_limit'),
+                   evidence_offset=ready.get('activity_source_offset'))
         connection.send(dict(kind='started', pid=os.getpid()))
         while True:
             command = connection.recv()
@@ -170,9 +82,10 @@ def collector_process(connection, home, index, evidence, trace_path, profile, mo
                 profiler = cProfile.Profile()
                 profiler.enable()
             while True:
-                value = service.poll()
+                value = service.poll(detailed=False)
                 polls += 1
-                sessions = {s['id']: s for s in value['sessions']}
+                sessions = {s['id']: (dict(json.loads(zlib.decompress(s.payload)), **s)
+                    if isinstance(s, EncodedSession) else s) for s in value['sessions']}
                 selected = sessions.get(command['sid'], {})
                 if collected_matches(value, selected, command):
                     break
@@ -183,6 +96,7 @@ def collector_process(connection, home, index, evidence, trace_path, profile, mo
                 profiler.dump_stats(str(Path(trace_path).with_name(command['scenario'] + '-collector.pstats')))
             stamp = trace.emit('collector_publication', scenario=command['scenario'],
                                owners=len(sessions), calls=sum(len(s['history']) for s in sessions.values()),
+                               demand=value.get('demand'),
                                selected=fingerprint(dict(selected, calls=len(selected.get('history', ())),
                                    latest_key=selected['history'][-1]['key'] if selected.get('history') else None)), polls=polls,
                                cpu_seconds=time.process_time() - cpu,
@@ -199,7 +113,10 @@ def collector_process(connection, home, index, evidence, trace_path, profile, mo
 
 
 def collected_matches(snapshot, selected, command, *, observed_activity=None):
-    return bool(snapshot['usage_collection_complete']
+    return bool(selected.get('collection_complete')
+                and snapshot.get('demand', {}).get('aggregate') == command.get('aggregate', False)
+                and (not command.get('owners') or snapshot['usage_collection_complete']
+                     and not snapshot['index'].get('loading'))
                 and len(snapshot['sessions']) >= command.get('owners', 0)
                 and len(selected.get('history', ())) == command['calls']
                 and (not command.get('activity') or any(
@@ -214,10 +131,14 @@ def watcher_process(connection, home, index, evidence, trace_path, profile, *, h
     from cachemonitor.collection_replay import EncodedSession
     import zlib
     trace = Trace(trace_path)
+    module_path = Path(usage_collection.__file__).resolve()
+    assert module_path.parents[1] == ROOT, (module_path, ROOT)
+    trace.emit('product_import', role='collector', checkout=str(ROOT), module_path=str(module_path))
     send_lock = threading.Lock()
     expectation_lock = threading.Lock()
     expectation = [None]
     stopping = threading.Event()
+    started = False
     original_poll = usage_collection.CollectorService.poll
     original_stopping = usage_collection.CollectorService.stopping
 
@@ -242,16 +163,23 @@ def watcher_process(connection, home, index, evidence, trace_path, profile, *, h
             send(dict(kind='armed', scenario=command['scenario']))
 
     def poll(service, *values, **kwargs):
-        started = time.process_time()
+        nonlocal started
+        cpu = time.process_time()
         trace.emit('collector_entry')
         value = original_poll(service, *values, **kwargs)
+        if not started:
+            trace.emit('collector_ready', demand=value.get('demand'),
+                       evidence_highwater=value.get('activity_source_limit'),
+                       evidence_offset=value.get('activity_source_offset'))
+            send(dict(kind='started', pid=os.getpid()))
+            started = True
         stamp = time.perf_counter_ns()
         with expectation_lock:
             command = expectation[0]
         if command is not None:
             selected = next((row for row in value['sessions'] if row['id'] == command['sid']), {})
             if isinstance(selected, EncodedSession):
-                selected = json.loads(zlib.decompress(selected.payload))
+                selected = dict(json.loads(zlib.decompress(selected.payload)), **selected)
             if command.get('activity'):
                 matches = [row for row in value.get('request_activity', ())
                     if all(row.get(key)==expected for key,expected in command['activity'].items())]
@@ -264,9 +192,10 @@ def watcher_process(connection, home, index, evidence, trace_path, profile, *, h
             if collected_matches(value, selected, command, observed_activity=command['observed_activity']):
                 trace.emit('collector_publication', scenario=command['scenario'],
                            published_ns=stamp, owners=len(value['sessions']), source_epoch=service.epoch,
+                           demand=value.get('demand'),
                            selected=fingerprint(dict(selected, calls=len(selected.get('history', ())),
                                latest_key=selected['history'][-1]['key'] if selected.get('history') else None)),
-                           cpu_seconds=time.process_time() - started,
+                           cpu_seconds=time.process_time() - cpu,
                            source_hint=bool(kwargs.get('source_hint')),
                            activity_observed_ns=command['activity_observed_ns'])
                 with expectation_lock:
@@ -283,7 +212,6 @@ def watcher_process(connection, home, index, evidence, trace_path, profile, *, h
     usage_collection.CollectorService.stopping = lambda service: stopping.is_set() or original_stopping(service)
     controls_thread = threading.Thread(target=controls, name='benchmark-control', daemon=True)
     controls_thread.start()
-    send(dict(kind='started', pid=os.getpid()))
     sys.argv = ['usage-collector', *[part for item in (homes or [home])
         for part in ('--codex-home', str(item))], '--index-path', str(index),
         '--evidence-path', str(evidence)]
@@ -320,17 +248,23 @@ class Scenario:
     observed_activity: list = field(default_factory=list)
     source_at: float = 0.
     unattributed: bool = False
+    aggregate: bool = False
 
     def matches(self, data, home):
-        return bool(self.rows and fingerprint(data) == self.identity(home)
+        return bool(self.source_ns and self.rows and fingerprint(data) == self.identity(home)
                     and (self.previous_revision is None
                          or tuple(data.get('_overlay_revision') or ()) != self.previous_revision))
 
     def matches_snapshot(self, value, home):
         if self.unattributed:
             return bool(self.source_at and value['ts'] >= self.source_at
-                        and not any(s['id'] == self.sid for s in value.get('overlay_sessions', ())))
+                        and all(self.empty_selected(s, home) for s in value.get('overlay_sessions', ())
+                                if s['id'] == self.sid))
         return any(self.matches(s, home) for s in value.get('overlay_sessions', ()))
+
+    def empty_selected(self, data, home):
+        return (data is None or fingerprint(data) == [str(home), self.sid, 0, None]
+                and not any(data.get(key) for key in ('latest', 'recent')))
 
     def identity(self, home):
         return [str(home), self.sid, len(self.rows), self.rows[-1]['key']]
@@ -370,7 +304,8 @@ def append_rows(home, scenario, count, trace):
 
 def check_output(data, scenario, home):
     if scenario.unattributed:
-        return data is None and scenario.collector_ns is not None and scenario.bridge_ns is not None
+        return (scenario.empty_selected(data, home) and (data is None or not data.get('_recent_refs'))
+                and scenario.collector_ns is not None and scenario.bridge_ns is not None)
     if not scenario.matches(data, home) or data.get('_recent_refs'):
         return False
     if scenario.evidence and any(data.get('latest', {}).get(k) != v for k, v in scenario.evidence.items()):
@@ -455,6 +390,7 @@ def run(args, directory, report):
     from PySide6.QtCore import QEventLoop, QTimer, Qt
     from cachemonitor import analysis_worker
     from cachemonitor.overlay_view import OverlayContent
+    from cachemonitor.usage_collection import CollectionClient
     home = directory / 'home'
     home.mkdir()
     (home / 'sessions').mkdir()
@@ -471,6 +407,8 @@ def run(args, directory, report):
     surface = NativeOverlayTarget(directory, app)
     controller, native = surface.controller, surface.native
     bridge = None
+    query_overlaps = ()
+    demand = CollectionClient([str(home)], index, evidence)
     current = None
     connected = False
     paint = OverlayContent.paint
@@ -480,6 +418,10 @@ def run(args, directory, report):
         def receive(self, value):
             result = super().receive(value)
             if current is not None and result is not None:
+                if not current.matches_snapshot(result, home):
+                    trace.emit('snapshot_rejected', scenario=current.name, source_at=result['ts'], expected_at=current.source_at,
+                        summaries=[dict(identity=fingerprint(s), recent_refs=s.get('_recent_refs'), empty=current.empty_selected(s, home))
+                                   for s in result.get('overlay_sessions', ())])
                 if current.matches_snapshot(result, home):
                     if current.receiver_ns is None:
                         current.receiver_ns = trace.emit('snapshot_receiver', scenario=current.name)
@@ -530,6 +472,9 @@ def run(args, directory, report):
                 if predicate():
                     loop.quit()
                 elif time.monotonic() >= deadline:
+                    trace.emit('wait_timeout', label=label, data=controller.widget.content_model.data,
+                        state=controller.widget.content_model.state, collection=controller.collection_evidence,
+                        visible=controller.widget.isVisible(), qml_errors=controller.widget.qml_errors)
                     raise TimeoutError(label)
             except BaseException as error:
                 errors.append(error)
@@ -546,8 +491,10 @@ def run(args, directory, report):
     armed = [None]
 
     def arm(scenario, count=0, owners=0):
+        demand.set_demand([(None, scenario.sid)], aggregate=bool(owners))
         command = dict(kind='poll', scenario=scenario.name, sid=scenario.sid,
-                       calls=len(scenario.rows) + count, owners=owners, deadline=args.deadline, activity=scenario.activity,
+                       calls=len(scenario.rows) + count, owners=owners, aggregate=bool(owners or scenario.aggregate),
+                       deadline=args.deadline, activity=scenario.activity,
                        evidence={k:v for k,v in scenario.evidence.items()
                                  if k in ('response_status', 'response_model', 'timing_valid')})
         if args.collector == 'watcher':
@@ -562,11 +509,14 @@ def run(args, directory, report):
         append_rows(home, scenario, count, trace)
 
     def collect(scenario, owners=0):
+        if args.collector == 'entry':
+            demand.set_demand([(None, scenario.sid)], aggregate=bool(owners))
         if args.collector == 'watcher' and armed[0] != (scenario, owners):
             arm(scenario, owners=owners)
         if args.collector == 'entry':
             parent.send(dict(kind='poll', scenario=scenario.name, sid=scenario.sid,
-                             calls=len(scenario.rows), owners=owners, deadline=args.deadline, activity=scenario.activity,
+                             calls=len(scenario.rows), owners=owners, aggregate=bool(owners or scenario.aggregate),
+                             deadline=args.deadline, activity=scenario.activity,
                              evidence={k:v for k,v in scenario.evidence.items()
                                        if k in ('response_status', 'response_model', 'timing_valid')}))
         wait_for(parent.poll, 'collector publication')
@@ -581,13 +531,15 @@ def run(args, directory, report):
         if scenario.activity:
             assert len(scenario.observed_activity) == 1, value
         armed[0] = None
+        if owners:
+            demand.set_demand([(None, scenario.sid)])
         return value
 
-    def start_bridge(label, entered=None, release=None):
+    def start_bridge(label, entered=None, release=None, refresh=None, query_overlaps=()):
         nonlocal bridge
         analysis_worker.process_main = partial(analysis_process,
-            trace_path=directory / (label + '-analysis.jsonl'), profile=args.profile,
-            entered=entered, release=release)
+            trace_path=directory / (label + '-analysis.jsonl'), root=ROOT, profile=args.profile,
+            entered=entered, release=release, refresh=refresh, query_overlaps=query_overlaps)
         bridge = analysis_worker.AnalysisBridge([str(home)], index,
             model_evidence_path=evidence, quota_path=quota, cache_floor=0)
 
@@ -608,19 +560,20 @@ def run(args, directory, report):
         bridge.failure.connect(report['errors'].append)
         bridge.fault.connect(controller.receive_overlay_fault)
         controller.overlay_loader = bridge.request_overlay_detail
+        controller.selection_loader = bridge.select_session
+        selection = controller.target_state.get('selection')
+        controller.selection_loader(selection.thread_id if selection and selection.host == 'local' else None)
         bridge.start()
 
     def stop_bridge():
         nonlocal bridge
         if bridge is not None:
+            controller.selection_loader = controller.overlay_loader = None
             bridge.requestInterruption()
             wait_for(lambda: not bridge.isRunning(), 'analysis shutdown', check_errors=False)
             assert bridge.process is None or not bridge.process.is_alive()
             bridge.wait()
             bridge = None
-
-    def select(scenario):
-        surface.select(scenario.sid)
 
     def finish(scenario):
         wait_for(lambda: scenario.frame_ns is not None, scenario.name + ' native frame')
@@ -690,7 +643,7 @@ def run(args, directory, report):
             current = Scenario('unattributed_' + status, unknown, unattributed=True,
                 activity=dict(attempt='local-unattributed-request', status=status,
                               response_id='' if status == 'pending' else 'unbound-response'))
-            select(current)
+            surface.select(current.sid)
             if bridge is None:
                 start_bridge('unattributed')
             observe(current, status, current.activity['response_id'])
@@ -698,7 +651,7 @@ def run(args, directory, report):
         fresh = Scenario('fresh', str(uuid.uuid4()))
         add_session(home, fresh.sid, 'Fresh benchmark session')
         current = fresh
-        select(current)
+        surface.select(current.sid)
         append(current, 1)
         collect(current)
         start_bridge('fresh')
@@ -730,7 +683,7 @@ def run(args, directory, report):
         collect(current, owners=args.owners)
         current = Scenario('restart_retained', current.sid, list(current.rows))
         current.source_ns = trace.emit('analysis_restart', scenario=current.name)
-        select(current)
+        surface.select(current.sid)
         start_bridge('restart')
         finish(current)
         current = Scenario('warm_retained', current.sid, list(current.rows))
@@ -740,10 +693,11 @@ def run(args, directory, report):
         current = Scenario('new_session_retained', str(uuid.uuid4()))
         add_session(home, current.sid, 'New session beside retained history')
         append(current, 1)
-        select(current)
+        surface.select(current.sid)
         collect(current)
         finish(current)
         stop_bridge()
+        expected_calls = args.owners * args.rows + 2
         if not args.skip_growth:
             from cachemonitor.prepared_store import Limits
             growth_owners=Limits().owners_per_batch+1
@@ -753,23 +707,91 @@ def run(args, directory, report):
                 append_rows(home, owner, args.rows, trace)
             current = Scenario('growth_seed', current.sid, list(current.rows))
             collect(current, owners=args.owners + growth_owners + 1)
-            entered, release = context.Event(), context.Event()
+            entered, release, refresh = (context.Event() for _ in range(3))
             quota = directory / 'growth-quota.sqlite'
-            start_bridge('growth', entered, release)
+            current.source_ns = trace.emit('analysis_restart', scenario=current.name)
+            start_bridge('growth', entered, release, refresh)
+            wait_for(lambda: current.bridge_ns is not None and current.frame_ns is not None,
+                     'selected native frame before aggregate preparation')
+            aggregate_results = []
+            bridge.result.connect(aggregate_results.append)
+            now = time.time()
+            bridge.request('growth-aggregate', dict(page=1, start=0, end=now + 60, now=now + 60,
+                period='custom', category_usage=True, usage=dict(dimension='model', metric='calls')), ())
+            trace.emit('aggregate_requested', scenario='growth_during_conversion')
             try:
-                wait_for(entered.is_set, 'incomplete committed conversion cohort')
-                current = Scenario('growth_during_conversion', current.sid, list(current.rows))
+                wait_for(entered.is_set, 'incomplete committed aggregate conversion cohort')
+                current = Scenario('growth_during_conversion', current.sid, list(current.rows), aggregate=True)
                 append(current, 1)
                 collect(current)
+                refresh.set()
+                finish(current)
+                assert not release.is_set() and not aggregate_results
+                trace.emit('selected_live_during_aggregate', scenario=current.name)
             finally:
                 release.set()
+                refresh.set()
+            wait_for(lambda: bool(aggregate_results), 'aggregate preparation after gate release')
+            result = aggregate_results[-1]
+            assert result['id'] == 'growth-aggregate', result
+            expected_calls = (args.owners + growth_owners) * args.rows + 3
+            assert result['result']['analysis']['response_count'] == expected_calls, result
+            trace.emit('aggregate_completed', scenario=current.name, request=result['id'], calls=expected_calls)
+            report['samples'][-1]['controlled_overlap'] = dict(kind='aggregate_conversion', terminal='completed')
+            bridge.cancel_queries()
+        stop_bridge()
+        query_overlaps = tuple(QueryOverlap(kind, kind + '-overlap',
+            entered=context.Event(), release=context.Event(), cancelled=context.Event(),
+            finished=context.Event(), deadline=args.deadline) for kind in ('comparison', 'trend'))
+        start_bridge('query-overlap', query_overlaps=query_overlaps)
+        query_results, stale_results = [], []
+        bridge.result.connect(query_results.append)
+        bridge.stale.connect(stale_results.append)
+        now = time.time()
+        _, comparison, trend, _ = query_shapes(320)
+        comparison = dict(comparison, start=0, end=now + 60, now=now + 60)
+        trend = dict(trend, start=now - 7 * 86400, end=now + 60, now=now + 60,
+                     time_range=[now - 7 * 86400, now + 60])
+        for overlap, query in zip(query_overlaps, (comparison, trend)):
+            bridge.request(overlap.request, query, ())
+            wait_for(overlap.entered.is_set, overlap.kind + ' query acquired its inputs')
+            current = Scenario('selected_during_' + overlap.kind, current.sid, list(current.rows), aggregate=True)
+            append(current, 1)
+            collect(current)
             finish(current)
+            expected_calls += 1
+            assert not overlap.release.is_set() and not overlap.finished.is_set()
+            assert not any(value['id'] == overlap.request for value in query_results + stale_results)
+            trace.emit('selected_live_during_query', scenario=current.name, request=overlap.request,
+                       boundary=overlap.boundary, controlled_overlap=True)
+            bridge.cancel_queries()
+            wait_for(overlap.cancelled.is_set, overlap.kind + ' query cancellation observed')
+            overlap.release.set()
+            wait_for(overlap.finished.is_set, overlap.kind + ' query unwound after cancellation')
+            replacement = overlap.request + '-current'
+            bridge.request(replacement, query, ())
+            wait_for(lambda: any(value['id'] == replacement for value in query_results),
+                     overlap.kind + ' current-generation query completion')
+            result = next(value for value in query_results if value['id'] == replacement)
+            value = result['result']['performance' if overlap.kind == 'trend' else 'usage']
+            calls = value['calls'] if overlap.kind == 'trend' else value['metrics']['calls']['value']
+            assert calls == expected_calls, result
+            assert not any(value['id'] == overlap.request for value in query_results + stale_results)
+            assert check_output(controller.widget.content_model.data, current, home)
+            report['samples'][-1]['controlled_overlap'] = dict(kind=overlap.kind, boundary=overlap.boundary,
+                terminal='cancelled', replacement=replacement, replacement_calls=calls)
+            trace.emit('controlled_query_current_completed', scenario=current.name, request=replacement, calls=calls)
+            bridge.cancel_queries()
         report['work'] = dict(scenarios=len(report['samples']),
                               checked_calls=sum(s['calls'] for s in report['samples']),
                               model_requests=0, failures=len(report['errors']))
         report['renderer'] = str(controller.widget.quick.quickWindow().rendererInterface().graphicsApi())
     finally:
+        for overlap in query_overlaps:
+            overlap.release.set()
         stop_bridge()
+        demand.set_demand()
+        demand.close()
         OverlayContent.paint = paint
         analysis_worker.SnapshotReceiver = receiver
         surface.stop()
@@ -792,7 +814,6 @@ def code_identity(directory, name='sources.json'):
     paths.extend(str(path.relative_to(ROOT)).replace('\\', '/')
                  for path in (ROOT / 'cachemonitor').rglob('*')
                  if path.suffix in ('.py', '.qml'))
-    paths.extend(('tools/benchmark_overlay_latency.py', 'tools/benchmark_overlay_recovery.py'))
     hashes = {path:hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
               for path in sorted(set(paths)) if path and (ROOT / path).is_file()}
     (directory / name).write_text(json.dumps(hashes, sort_keys=True, indent=2), encoding='utf-8')
@@ -800,7 +821,8 @@ def code_identity(directory, name='sources.json'):
     receipt = ROOT / 'cachemonitor/_cpu_native.build.json'
     return dict(head=git('rev-parse', 'HEAD').decode().strip(),
                 tree=git('rev-parse', 'HEAD^{tree}').decode().strip(),
-                diff_sha256=hashlib.sha256(git('diff', '--binary', 'HEAD')).hexdigest(),
+                diff_sha256=hashlib.sha256(git('diff', '--binary', 'HEAD', '--',
+                    'cachemonitor', 'native', 'requirements-release.lock')).hexdigest(),
                 source_sha256=hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest(),
                 native_sha256=hashlib.sha256(native.read_bytes()).hexdigest(),
                 native_receipt=json.loads(receipt.read_text(encoding='utf-8')))
@@ -826,13 +848,23 @@ def summarize_trace(directory, report):
         generated_calls=sum(e.get('appended', 0) for e in events if e['stage'] == 'source_event'),
         collector_publications=sum(e['stage'] == 'collector_publication' for e in events),
         model_requests=0, failures=len(report['errors']))
+    report['controlled_query_events'] = sorted((e for e in events if e['stage'].startswith('controlled_query_')
+        or e['stage'] == 'selected_live_during_query'), key=lambda row: row['ns'])
+    report['product_imports'] = [e for e in events if e['stage'] == 'product_import']
     report['cpu_stages'] = [e for e in events if e['stage'] == 'cpu_stages']
     report['interrupted_profile_cycles'] = sum(e['outcome'] != 'complete' for e in report['cpu_stages'])
     report['profiles'] = [str(path.name) for path in directory.glob('*.pstats')]
 
 
+def harness_identity():
+    paths = [HARNESS_ROOT / 'tools' / name for name in
+             ('benchmark_overlay_latency.py', 'benchmark_overlay_worker.py', 'benchmark_cumulative.py')]
+    return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--checkout', type=Path, default=ROOT)
     parser.add_argument('--output', type=Path, default=ROOT / 'artifacts/overlay-latency/measurement')
     parser.add_argument('--owners', type=int, default=3)
     parser.add_argument('--rows', type=int, default=8)
@@ -845,6 +877,7 @@ def main():
         parser.error('owners >= 1, rows >= 2, and deadline > 0 are required')
     if os.name != 'nt':
         parser.error('this benchmark requires native Windows Qt rendering')
+    os.environ['CODEXON_OVERLAY_BENCHMARK_CHECKOUT'] = str(ROOT)
     output = args.output.resolve()
     allowed = (ROOT / 'artifacts/overlay-latency/measurement').resolve()
     if not output.is_relative_to(allowed):
@@ -863,6 +896,7 @@ def main():
         collector=args.collector, simulated_model_timings=True,
         identity_limit='Global attempts without source-bound response identities do not identify a selected owner. Their native cost and speed stay unknown.',
         checkout=str(ROOT), python=sys.executable, owners=args.owners, rows=args.rows,
+        harness=harness_identity(),
         lock_sha256=hashlib.sha256((ROOT / 'requirements-release.lock').read_bytes()).hexdigest(),
         samples=[], errors=[], host_before=host_snapshot())
     try:
@@ -878,6 +912,9 @@ def main():
         report['host_after'] = host_snapshot()
         report['failure_count'] = len(report['errors'])
         report['code_after'] = code_identity(directory, name='sources-after.json')
+        report['harness_after'] = harness_identity()
+        if report['harness'] != report['harness_after']:
+            report['errors'].append('benchmark script changed during measurement')
         if report.get('code') != report['code_after']:
             report['errors'].append('source identity changed during measurement')
         summarize_trace(directory, report)

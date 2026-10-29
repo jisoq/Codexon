@@ -171,7 +171,8 @@ def test_benchmark_trace_instances_keep_concurrent_records_complete(tmp_path):
     assert len(records) == 32 and all(row['payload'] == 'x'*100000 for row in records)
 
 
-def test_benchmark_watcher_keeps_activity_until_owner_replay_finishes(tmp_path,monkeypatch):
+@pytest.mark.parametrize('encoded',[False,True])
+def test_benchmark_watcher_keeps_activity_until_owner_replay_finishes(tmp_path,monkeypatch,encoded):
     from queue import Queue
     from threading import Event,current_thread
     from types import SimpleNamespace
@@ -193,10 +194,18 @@ def test_benchmark_watcher_keeps_activity_until_owner_replay_finishes(tmp_path,m
             sent.append(value)
             if value['kind']=='armed':armed.set()
         def close(self):commands.put(None)
-    selected=dict(home='home',id='owner',history=[dict(key='response',response_status='created')])
+    selected=dict(home='home',id='owner',collection_complete=True,
+                  history=[dict(key='response',response_status='created')])
+    published=selected
+    if encoded:
+        import zlib
+        from cachemonitor.collection_replay import EncodedSession
+        published=EncodedSession(dict(home='home',id='owner',collection_complete=True),
+            zlib.compress(json.dumps(dict(selected,collection_complete=False)).encode()),b'proof','digest')
     snapshots=iter([
         dict(usage_collection_complete=False,sessions=[],request_activity=[activity],errors=[],ts=1),
-        dict(usage_collection_complete=True,sessions=[selected],request_activity=[],errors=[],ts=2)])
+        dict(usage_collection_complete=False,sessions=[published],demand=dict(aggregate=False),
+             request_activity=[],errors=[],ts=2)])
     monkeypatch.setattr(usage_collection.CollectorService,'poll',lambda *args,**kwargs:next(snapshots))
     monkeypatch.setattr(usage_collection.CollectorService,'stopping',usage_collection.CollectorService.stopping)
     def main():
