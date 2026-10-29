@@ -753,3 +753,282 @@ def test_real_32_mib_owner_group_cache_overflow_keeps_complete_exact_results():
         assert row['group_label']==reference['group_label']
     for name in ('comparison_cache_bytes','comparison_working_peak_bytes','comparison_result_bytes'):
         assert engine.read_metrics[name]<=comparison.LIMIT
+
+
+
+def test_certified_append_reuses_untouched_groups_and_exact_folded_rows():
+    owner=('home','one')
+    owners={owner:[dict(scalar_call(value),model=model) for model,values in
+                    [('hot',(1.,2**53+1)),('stable',(-0.0,0,2**80+1))] for value in values],
+            ('home','two'):[dict(scalar_call(0.0),model='stable'),dict(scalar_call(5),model='other')]}
+    engine=ProjectedEngine(owners);q=all_query()
+    project(engine,q)
+    previous=engine._comparison_cache;retained=deepcopy(previous)
+    groups=previous['entries'][owner]['groups'];folded={row.key:row for row in previous['fold'].rows}
+    engine.replace(owner,owners[owner]+[dict(scalar_call(0.1),model='hot',reasoning=None)],append=True)
+    actual=project(engine,q)
+    expected=project(ProjectedEngine(deepcopy(engine.owners)),q)
+    assert exact_scalars(actual['usage'])==exact_scalars(expected['usage'])
+    assert actual['analysis']==expected['analysis']
+    current=engine._comparison_cache
+    for key,(_,aggregate) in groups.items():
+        assert exact_scalars(aggregate.totals.result())==exact_scalars(retained['entries'][owner]['groups'][key][1].totals.result())
+        assert (current['entries'][owner]['groups'][key][1] is aggregate)==(key.model=='stable')
+    for row in current['fold'].rows:
+        assert (row is folded[row.key])==(row.key.model!='hot')
+    for rows in (list(reversed(list(engine.owners.items()))),list(engine.owners.items())[1:]):
+        engine.owners=dict(rows)
+        assert exact_scalars(project(engine,q)['usage'])==exact_scalars(
+            project(ProjectedEngine(deepcopy(engine.owners)),q)['usage'])
+
+
+@pytest.mark.parametrize('consumer',['engine','handler'])
+@pytest.mark.parametrize('fallback',[False,True])
+def test_live_publication_advances_while_comparison_fold_waits(tmp_path,monkeypatch,consumer,fallback):
+    from dataclasses import replace
+    from threading import Event,Thread
+    from cachemonitor import comparison_usage as comparison
+    from cachemonitor.prepared_query import PreparedQuery
+
+    values=[]
+    template=sources()[0]
+    for number in range(32):
+        source=deepcopy(template);source['id']=str(number)
+        source['history']=[dict(source['history'][0],sid=str(number),key=f'call-{number}')]
+        values.append(source)
+    values[0]['history'].append(dict(values[0]['history'][0],key='future',ts=120))
+    q=query();q['usage'].update(dimension='all',showUnknown=True)
+    reference=AnalysisEngine();reference.ingest(values)
+    expected=project(reference,q)
+    if fallback:monkeypatch.setattr(comparison,'LIMIT',32*1024)
+    entered,release=Event(),Event();results=[];failures=[]
+    finish=comparison._finish_fold
+    def wait_for_publication(*args,**kwargs):
+        entered.set()
+        assert release.wait(10),'writer did not finish while comparison calculation waited'
+        return finish(*args,**kwargs)
+    monkeypatch.setattr(comparison,'_finish_fold',wait_for_publication)
+    with storage.PreparedStore(tmp_path/'detached-comparison.sqlite') as store:
+        first=publish(store,values,1)
+        store.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        def calculate():
+            try:
+                if consumer=='handler':
+                    with closing(PreparedQuery(store.path)) as handler:
+                        response=handler(dict(kind='query',id=1,logical='comparison',query=q),first,lambda:False)
+                        assert response['kind']=='result'
+                        results.append((response['result'],response['valid_until'],handler.engine.read_metrics.copy()))
+                else:
+                    with closing(PreparedAnalysisEngine(store.path,first)) as engine:
+                        result=engine.page_query(q)
+                        results.append((result,result['valid_until'],engine.read_metrics.copy()))
+            except BaseException as error:failures.append(error)
+        thread=Thread(target=calculate,daemon=True);thread.start()
+        try:
+            assert entered.wait(10),'comparison did not reach captured calculation'
+            changed=deepcopy(values);changed[0]['history'][0]['input']=20000
+            second=publish(store,changed,2)
+            before=store.disk_usage()['wal']
+            store.limits=replace(store.limits,wal_bytes=before+1024*1024,write_reserve_bytes=1024*1024+4096)
+            changed[0]['history'][0]['input']=30000;changed[0]['history'][-1]['ts']=130
+            third=publish(store,changed,3)
+            assert first.generation<second.generation<third.generation
+            assert thread.is_alive()
+            with storage.PreparedReader(store.path) as reader,reader.pin(third) as current:
+                assert current.record('home','0','call-0')['input']==30000
+        finally:
+            release.set();thread.join(10)
+        assert not thread.is_alive() and not failures,failures
+        result,valid_until,metrics=results[0]
+        assert exact_scalars(result['usage'])==exact_scalars(expected['usage'])
+        assert result['analysis']==expected['analysis']
+        assert valid_until==expected['valid_until']==120.002
+        if consumer=='handler':assert result['prepared_token']==(first.instance,first.generation)
+        assert (metrics['comparison_cache_bytes']==0) is fallback
+
+
+@pytest.mark.parametrize('stage',['fold','delivery'])
+def test_detached_comparison_uses_request_cancellation_and_can_retry(tmp_path,monkeypatch,stage):
+    from threading import Event
+    from cachemonitor import comparison_usage as comparison
+    from cachemonitor.prepared_query import PreparedQuery
+
+    cancelled=Event();method='_finish_fold' if stage=='fold' else '_deliver'
+    original=getattr(comparison,method)
+    def cancel_request(*args,**kwargs):
+        cancelled.set()
+        return original(*args,**kwargs)
+    with storage.PreparedStore(tmp_path/'cancel-comparison.sqlite') as store:
+        token=publish(store,sources(),1)
+        with closing(PreparedQuery(store.path)) as handler:
+            message=dict(kind='query',id=1,logical='comparison',query=query())
+            with monkeypatch.context() as patch:
+                patch.setattr(comparison,method,cancel_request)
+                with pytest.raises(storage.ReadCancelled):handler(message,token,cancelled.is_set)
+            assert handler.engine.snapshot is None
+            assert not hasattr(handler.engine,'_comparison_cache')
+            cancelled.clear()
+            result=handler(message,token,cancelled.is_set)
+            assert result['kind']=='result' and result['result']['analysis']['response_count']==8
+
+
+def test_prepared_handler_keeps_ordinary_page_expiry_in_its_read(tmp_path):
+    from cachemonitor.prepared_query import PreparedQuery
+
+    values=sources();values[0]['history'].append(dict(values[0]['history'][0],key='future',ts=120))
+    q=query();q.update(category_usage=False,presentation=False)
+    with storage.PreparedStore(tmp_path/'ordinary-page.sqlite') as store:
+        token=publish(store,values,1)
+        with closing(PreparedQuery(store.path)) as handler:
+            result=handler(dict(kind='query',id=1,logical='ordinary',query=q),token,lambda:False)
+            assert result['kind']=='result'
+            assert len(result['result']['analysis']['responses'])==8
+            assert result['valid_until']==result['result']['valid_until']==120.002
+            assert handler.engine.snapshot is None
+
+
+def reference_fold(entries,budget):
+    from struct import calcsize
+    import sys
+    from cachemonitor import comparison_usage as comparison
+    groups={};total=comparison.Totals();sessions=0
+    budget.reserve(sys.getsizeof(groups)+total.retained_bytes())
+    for entry in entries.values():
+        if entry['groups']:sessions+=1
+        for key,(label,value) in entry['groups'].items():
+            if key not in groups:
+                totals=comparison.Totals()
+                budget.reserve(256+comparison._size(key)+comparison._size(label)+totals.retained_bytes())
+                groups[key]=(label,totals,[])
+            _,totals,parts=groups[key]
+            before=totals.retained_bytes()+total.retained_bytes()
+            totals.merge(value.totals);total.merge(value.totals)
+            budget.reserve(totals.retained_bytes()+total.retained_bytes()-before+4*calcsize('P'))
+            parts.append(value)
+    return comparison._finish_fold(iter(groups.items()),len(groups),total,sessions,budget)
+
+
+def test_fold_group_accumulator_has_the_original_tuple_storage_bound():
+    import sys
+    from cachemonitor import comparison_usage as comparison
+    group=comparison._FoldGroup('label',True)
+    assert not hasattr(group,'__dict__')
+    assert sys.getsizeof(group)<=sys.getsizeof((group.label,group.totals,group.parts))
+    assert sys.getsizeof(group.parts)==sys.getsizeof([])
+
+
+def test_partial_fold_fits_the_exact_baseline_working_peak(monkeypatch):
+    from cachemonitor import comparison_usage as comparison
+    owners={('home',str(owner)):[dict(scalar_call(owner+1),model='hot'),
+        dict(scalar_call(-0.0 if owner%2 else 2**80+owner),model='stable')]
+        for owner in range(40)}
+    engine=ProjectedEngine(owners);q=all_query()
+    project(engine,q);previous=engine._comparison_cache
+    owner=next(iter(owners))
+    engine.replace(owner,owners[owner]+[dict(scalar_call(2**53+1),model='hot')],append=True)
+    project(engine,q)
+    entries=engine._comparison_cache['entries']
+    baseline=comparison._Budget(comparison.LIMIT)
+    expected=reference_fold(entries,baseline)
+    budget=comparison._Budget(baseline.peak)
+    finishes=[]
+    finish=comparison._finish_fold
+    def once(*args,**kwargs):
+        finishes.append(True)
+        return finish(*args,**kwargs)
+    monkeypatch.setattr(comparison,'_finish_fold',once)
+    actual=comparison._fold(entries,budget,previous)
+    assert exact_scalars(actual)==exact_scalars(expected)
+    assert budget.peak<=baseline.peak and len(finishes)==1
+    old={row.key:row for row in previous['fold'].rows}
+    assert all((row is old[row.key])==(row.key.model=='stable') for row in actual.rows)
+
+
+@pytest.mark.parametrize('change',['append','correction','remove_contribution','label','owner_order','owner_removal'])
+def test_partial_row_reuse_requires_unchanged_contributors_labels_and_owner_order(change):
+    from cachemonitor import comparison_usage as comparison
+    first=('home','one');second=('home','two')
+    owners={first:[dict(scalar_call(1),model='hot',project='p',project_name='Old'),
+                  dict(scalar_call(-0.0),model='stable',project='p',project_name='Old')],
+            second:[dict(scalar_call(2**80+1),model='hot',project='p',project_name='Old'),
+                    dict(scalar_call(0),model='stable',project='p',project_name='Old'),
+                    dict(scalar_call(2),model='other',project='p',project_name='Old')]}
+    engine=ProjectedEngine(owners);q=all_query()
+    if change=='label':q['usage']['dimension']='project'
+    project(engine,q);previous=engine._comparison_cache
+    old_rows={row.key:row for row in previous['fold'].rows}
+    if change=='append':
+        engine.replace(first,owners[first]+[dict(scalar_call(0.1),model='hot')],append=True)
+    elif change=='correction':
+        engine.replace(first,[dict(scalar_call(3),model='hot'),owners[first][1]])
+    elif change=='remove_contribution':
+        engine.replace(first,[owners[first][0]])
+    elif change=='label':
+        engine.contexts[first]=dict(project='p',project_name='New')
+        engine.replace(first,[dict(row,project_name='New') for row in owners[first]])
+    elif change=='owner_order':
+        engine.owners=dict(reversed(list(owners.items())))
+    else:
+        del engine.owners[first]
+    actual=project(engine,q)
+    expected=project(ProjectedEngine(deepcopy(engine.owners)),q)
+    assert exact_scalars(actual['usage'])==exact_scalars(expected['usage'])
+    current=engine._comparison_cache['fold']
+    for row in current.rows:
+        reusable=(change in ('append','correction','remove_contribution','label') and row.key.model=='other'
+                  or change=='append' and row.key.model=='stable')
+        assert (row is old_rows.get(row.key))==reusable
+    if change=='label':assert actual['usage']['rows'][0]['group_label']=='New'
+    assert previous['fold'].rows==tuple(old_rows.values())
+
+
+def test_fold_capacity_failure_after_completed_row_propagates_once_and_keeps_cache(monkeypatch):
+    from cachemonitor import comparison_usage as comparison
+    from cachemonitor.prepared_store import CapacityExceeded
+    owner=('home','one')
+    engine=ProjectedEngine({owner:[dict(scalar_call(1),model='first'),dict(scalar_call(2),model='second')]})
+    q=all_query();project(engine,q);published=engine._comparison_cache
+    engine.replace(owner,[dict(scalar_call(3),model='first'),dict(scalar_call(4),model='second')])
+    finishes=[];descriptions=[];rows=[]
+    finish=comparison._finish_fold;describe=comparison._describe
+    def once(groups,count,total,sessions,budget,**kwargs):
+        finishes.append(True)
+        def current():
+            for index,group in enumerate(groups):
+                if index==1:
+                    rows.append('completed')
+                    budget.maximum=budget.used
+                yield group
+        return finish(current(),count,total,sessions,budget,**kwargs)
+    def observed(*args,**kwargs):
+        descriptions.append(True)
+        return describe(*args,**kwargs)
+    monkeypatch.setattr(comparison,'_finish_fold',once)
+    monkeypatch.setattr(comparison,'_describe',observed)
+    with pytest.raises(CapacityExceeded,match='comparison aggregates'):
+        project(engine,q)
+    assert finishes==[True] and rows==['completed']
+    assert len(descriptions)==len(comparison.MEAN_FIELDS)
+    assert engine._comparison_cache is published
+
+
+def test_fold_reuse_checks_do_linear_group_lookups():
+    from cachemonitor import comparison_usage as comparison
+    class Groups(dict):
+        probes=0
+        def get(self,*args):
+            type(self).probes+=1
+            return super().get(*args)
+        def __contains__(self,key):
+            type(self).probes+=1
+            return super().__contains__(key)
+    owners={('home',str(owner)):[dict(scalar_call(owner+1),model='m'+str(owner)+'-'+str(group))
+        for group in range(4)] for owner in range(40)}
+    engine=ProjectedEngine(owners);project(engine,all_query())
+    previous=engine._comparison_cache
+    entries={owner:dict(entry,groups=Groups(entry['groups'])) for owner,entry in previous['entries'].items()}
+    aggregate_count=sum(len(entry['groups']) for entry in entries.values())
+    fold=comparison._fold(entries,comparison._Budget(comparison.LIMIT),previous)
+    assert fold.rows==previous['fold'].rows
+    assert all(row is old for row,old in zip(fold.rows,previous['fold'].rows))
+    assert Groups.probes<=2*aggregate_count

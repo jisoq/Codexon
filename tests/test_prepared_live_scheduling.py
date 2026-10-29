@@ -1,5 +1,6 @@
 from contextlib import closing
 from threading import Event
+from queue import Empty, Queue
 import time
 
 import pytest
@@ -133,3 +134,80 @@ def test_selected_update_is_published_between_history_chunks(tmp_path,monkeypatc
                 assert result['analysis']['response_count']==67
                 assert result['analysis']['session_count']==66
             finally:source_updated.set()
+
+def test_live_calls_continue_until_finite_history_completes(tmp_path, monkeypatch):
+    home, _ = fixture_home(tmp_path)
+    at = history(home, count=65)
+    target = tmp_path / 'index.sqlite'
+    requests = Queue()
+    gates = []
+    prepared_history = set()
+    progress = []
+    original = PreparedCohort.convert
+
+    def convert(coordinator, catalog, **kwargs):
+        changes = original(coordinator, catalog, **kwargs)
+        try:
+            for change in changes:
+                if catalog.get('authority') != 'selected':
+                    prepared_history.update(key for key in change['changed'] if key[1] != TID)
+                    progress.append(len(prepared_history))
+                    if not change['ready']:
+                        gate = Event()
+                        gates.append(gate)
+                        requests.put(gate)
+                        assert gate.wait(10), 'Live source update did not reach the committed history boundary'
+                yield change
+        finally:
+            changes.close()
+
+    monkeypatch.setattr(PreparedCohort, 'convert', convert)
+    receiver = SnapshotReceiver()
+    with closing(CollectorService([home], target)) as service, closing(CollectionClient([home], target)) as lease:
+        lease.set_demand([(None, TID)], aggregate=True)
+        complete(service)
+        with closing(PreparedWriter([home], target, None, tmp_path / 'quota.sqlite')) as writer:
+            try:
+                writer.set_selected([(None, TID)])
+                publication(service, writer, receiver,
+                    lambda value: any(row['id'] == TID for row in value['sessions']))
+                writer.set_aggregate(7)
+                expected_calls = 1
+                visible_calls = []
+                deadline = time.monotonic() + 30
+                aggregate = None
+                while time.monotonic() < deadline and aggregate is None:
+                    try:
+                        gate = requests.get_nowait()
+                    except Empty:
+                        gate = None
+                    if gate is not None:
+                        expected_calls += 1
+                        write_session(home, TID, count=expected_calls, at=at)
+                        complete(service)
+                        gate.set()
+                    service.poll(detailed=False)
+                    if writer.output.receiver.poll(.02):
+                        message = writer.output.take()
+                        assert message['kind'] not in ('fatal', 'error'), message
+                        if message['kind'] != 'snapshot':
+                            continue
+                        value = receiver.receive(message['value'])
+                        if value is None:
+                            continue
+                        for row in value.get('overlay_sessions', ()):
+                            if row['id'] == TID:
+                                visible_calls.append(row['calls'])
+                        if value.get('aggregate_request') == 7:
+                            aggregate = value
+                assert aggregate is not None, (progress, visible_calls, expected_calls)
+                assert expected_calls >= 4, 'The workload did not overlap repeated live updates'
+                assert set(range(2, expected_calls + 1)).issubset(visible_calls)
+                assert progress == sorted(progress) and progress[-1] == 65
+                result = all_calls(service, writer, receiver, aggregate)
+                assert result['analysis']['response_count'] == 65 + expected_calls
+                assert result['analysis']['session_count'] == 66
+                assert result['usage']['summary']['value'] == 65 + expected_calls
+            finally:
+                for gate in gates:
+                    gate.set()
